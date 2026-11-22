@@ -1,0 +1,2502 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Solar Report</title>
+  <!-- مكتبات قراءة الإكسيل وتصدير PDF والرسوم البيانية مع روابط بديلة لضمان العمل على الموبايل -->
+  <script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js" onerror="var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';document.head.appendChild(s);"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <!-- تحميل مكتبات التخزين السحابي والمحلي الدائم -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, doc, setDoc, getDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    const DB_NAME = 'SolarReportPermanentDB';
+    const STORE_NAME = 'reports';
+    const RECORD_KEY = 'latest_solar_file_wtr';
+
+    function saveToLocalDB(payload) {
+      return new Promise((resolve) => {
+        try {
+          const req = indexedDB.open(DB_NAME, 1);
+          req.onupgradeneeded = (e) => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains(STORE_NAME)) {
+              db.createObjectStore(STORE_NAME);
+            }
+          };
+          req.onsuccess = (e) => {
+            const db = e.target.result;
+            const tx = db.transaction(STORE_NAME, 'readwrite');
+            tx.objectStore(STORE_NAME).put(payload, RECORD_KEY);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+          };
+          req.onerror = () => resolve(false);
+        } catch (err) {
+          resolve(false);
+        }
+      });
+    }
+
+    function loadFromLocalDB() {
+      return new Promise((resolve) => {
+        try {
+          const req = indexedDB.open(DB_NAME, 1);
+          req.onupgradeneeded = (e) => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains(STORE_NAME)) {
+              db.createObjectStore(STORE_NAME);
+            }
+          };
+          req.onsuccess = (e) => {
+            const db = e.target.result;
+            const tx = db.transaction(STORE_NAME, 'readonly');
+            const getReq = tx.objectStore(STORE_NAME).get(RECORD_KEY);
+            getReq.onsuccess = () => resolve(getReq.result || null);
+            getReq.onerror = () => resolve(null);
+          };
+          req.onerror = () => resolve(null);
+        } catch (err) {
+          resolve(null);
+        }
+      });
+    }
+
+    let db = null;
+    let appId = 'solar-report-default';
+    let isCloudReady = false;
+
+    function getSyncKey() {
+      const urlParams = new URLSearchParams(window.location.search);
+      const urlKey = urlParams.get('sync');
+      if (urlKey) {
+        try { localStorage.setItem('solar_sync_key', urlKey); } catch (e) {}
+        return urlKey.trim().toUpperCase();
+      }
+      try {
+        const savedKey = localStorage.getItem('solar_sync_key');
+        if (savedKey) return savedKey.trim().toUpperCase();
+      } catch (e) {}
+      return 'DEFAULT_SHARED';
+    }
+
+    function setSyncKey(newKey) {
+      const cleanKey = newKey.trim().toUpperCase();
+      try { localStorage.setItem('solar_sync_key', cleanKey); } catch (e) {}
+      return cleanKey;
+    }
+
+    async function initCloudStorage() {
+      try {
+        const firebaseConfig = {
+          apiKey: "AIzaSyCn5GBEgRwEqcKFTLaC8yLJBPksIjU3T-k",
+          authDomain: "planning-with-ai-d2cc8.firebaseapp.com",
+          projectId: "planning-with-ai-d2cc8",
+          storageBucket: "planning-with-ai-d2cc8.firebasestorage.app",
+          messagingSenderId: "546238754383",
+          appId: "1:546238754383:web:0a54fca1dd8c601265043a"
+        };
+        appId = 'solar-report-default';
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        db = getFirestore(app);
+
+        await signInAnonymously(auth);
+        isCloudReady = true;
+      } catch (err) {
+        console.warn('Cloud init fallback to local DB:', err);
+      }
+    }
+
+    window.saveReportToCloud = async function(payload) {
+      const statusEl = document.getElementById('fileStatus');
+      const localSaved = await saveToLocalDB(payload);
+      let syncKey = getSyncKey();
+      if (syncKey === 'DEFAULT_SHARED') {
+        syncKey = setSyncKey('SR-' + Math.floor(1000 + Math.random() * 9000));
+      }
+
+      if (localSaved && statusEl) {
+        statusEl.innerHTML = `✅ تم حفظ الملف (${payload.fileName}) | كود المزامنة: <b style="color:#fbbf24; user-select:all;">${syncKey}</b>`;
+        statusEl.style.display = 'block';
+      }
+
+      try {
+        if (!isCloudReady) await initCloudStorage();
+        if (!db) {
+          if (statusEl) {
+            statusEl.innerHTML = `✅ تم حفظ الملف محلياً (${payload.fileName}) | لتحديث الهاتف اضغط <b>🔄 تحديث</b>`;
+          }
+          return;
+        }
+
+        const basePath = ['artifacts', appId, 'public', 'data', 'solar_reports'];
+        const wtrRecords = payload.wtrRecords || [];
+        const sheetRecords = payload.sheetRecords || [];
+        const CHUNK_SIZE = 1200;
+        const wtrChunks = Math.ceil(wtrRecords.length / CHUNK_SIZE);
+        const sheetChunks = Math.ceil(sheetRecords.length / CHUNK_SIZE);
+
+        for (let i = 0; i < wtrChunks; i++) {
+          const chunkRecords = wtrRecords.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+          await setDoc(doc(db, ...basePath, `${syncKey}_wtr_${i}`), { records: chunkRecords });
+        }
+
+        for (let i = 0; i < sheetChunks; i++) {
+          const chunkRecords = sheetRecords.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+          await setDoc(doc(db, ...basePath, `${syncKey}_sheet_${i}`), { records: chunkRecords });
+        }
+
+        const metaPayload = {
+          ...payload,
+          wtrRecords: [],
+          sheetRecords: [],
+          incomingRows: [],
+          wtrChunks,
+          sheetChunks,
+          syncKey,
+          updatedAt: Date.now()
+        };
+        await setDoc(doc(db, ...basePath, `${syncKey}_meta`), metaPayload);
+        await setDoc(doc(db, ...basePath, 'latest_meta'), metaPayload);
+
+        for (let i = 0; i < wtrChunks; i++) {
+          await setDoc(doc(db, ...basePath, `latest_wtr_${i}`), { records: wtrRecords.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE) });
+        }
+        for (let i = 0; i < sheetChunks; i++) {
+          await setDoc(doc(db, ...basePath, `latest_sheet_${i}`), { records: sheetRecords.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE) });
+        }
+
+        if (statusEl) {
+          statusEl.innerHTML = `☁️ تم الحفظ والمزامنة السحابية (${payload.fileName}) | كود الربط: <b style="color:#fbbf24; user-select:all;">${syncKey}</b>`;
+        }
+      } catch (err) {
+        console.warn('Cloud sync warning:', err);
+        if (statusEl) {
+          statusEl.innerHTML = `✅ تم حفظ الملف محلياً (${payload.fileName})`;
+        }
+      }
+    };
+
+    window.syncFromMobileCode = async function(codeInput) {
+      const code = codeInput ? setSyncKey(codeInput) : getSyncKey();
+      const statusEl = document.getElementById('fileStatus');
+      if (statusEl) {
+        statusEl.textContent = `⏳ جاري تحديث البيانات وجلب آخر شيت مرفوع...`;
+        statusEl.style.display = 'block';
+      }
+      const loaded = await fetchCloudByKey(code);
+      if (loaded) {
+        if (statusEl) {
+          statusEl.innerHTML = `✅ تم تحديث البيانات وجلب آخر شيت مرفوع بنجاح!`;
+        }
+      } else {
+        if (statusEl) {
+          statusEl.innerHTML = `⚠️ تعذر الاتصال بالسحابة من هذا المتصفح. يمكنك رفع الملف عبر زر <b>Upload File</b> وسيظل محفوظاً على هاتفك.`;
+        }
+        const modal = document.getElementById('syncModal');
+        const box = document.getElementById('currentSyncCodeBox');
+        if (box) box.textContent = `كود المزامنة الحالي لهذا الجهاز: ${getSyncKey()}`;
+        if (modal) modal.classList.add('open');
+      }
+    };
+
+    async function fetchCloudByKey(keyToFetch) {
+      try {
+        if (!isCloudReady) await initCloudStorage();
+        if (!db) return false;
+
+        const basePath = ['artifacts', appId, 'public', 'data', 'solar_reports'];
+        let metaSnap = await getDoc(doc(db, ...basePath, `${keyToFetch}_meta`));
+        let prefix = keyToFetch;
+
+        if (!metaSnap.exists()) {
+          metaSnap = await getDoc(doc(db, ...basePath, 'latest_meta'));
+          prefix = 'latest';
+        }
+
+        if (metaSnap.exists()) {
+          const metaData = metaSnap.data();
+          let fullWtr = [];
+          let fullSheet = [];
+
+          for (let i = 0; i < (metaData.wtrChunks || 0); i++) {
+            const snap = await getDoc(doc(db, ...basePath, `${prefix}_wtr_${i}`));
+            if (snap.exists() && Array.isArray(snap.data().records)) {
+              fullWtr = fullWtr.concat(snap.data().records);
+            }
+          }
+
+          for (let i = 0; i < (metaData.sheetChunks || 0); i++) {
+            const snap = await getDoc(doc(db, ...basePath, `${prefix}_sheet_${i}`));
+            if (snap.exists() && Array.isArray(snap.data().records)) {
+              fullSheet = fullSheet.concat(snap.data().records);
+            }
+          }
+
+          metaData.wtrRecords = fullWtr;
+          metaData.sheetRecords = fullSheet;
+          await saveToLocalDB(metaData);
+          if (typeof window.loadSavedReportData === 'function') {
+            window.loadSavedReportData(metaData);
+          }
+          return true;
+        }
+      } catch (err) {
+        console.warn('Restore cloud report warning:', err);
+      }
+      return false;
+    }
+
+    async function restoreSavedReport() {
+      const syncKey = getSyncKey();
+      const cloudLoaded = await fetchCloudByKey(syncKey);
+      if (cloudLoaded) return;
+
+      const localData = await loadFromLocalDB();
+      if (localData && typeof window.loadSavedReportData === 'function') {
+        window.loadSavedReportData(localData);
+      }
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', restoreSavedReport);
+    } else {
+      restoreSavedReport();
+    }
+  </script>
+  <style>
+    :root {
+      --bg: #0a0a0c;
+      --card: #141519;
+      --border: #27272a;
+      --text: #f4f4f5;
+      --muted: #a1a1aa;
+      --gold: #10b981;
+      --gold-dim: rgba(16, 185, 129, 0.14);
+      --input-bg: #09090b;
+      --row-hover: #1c1e24;
+      --table-head: #09090b;
+    }
+    body.light-mode {
+      --bg: #f8fafc;
+      --card: #ffffff;
+      --border: #e2e8f0;
+      --text: #0f172a;
+      --muted: #64748b;
+      --gold: #059669;
+      --gold-dim: #d1fae5;
+      --input-bg: #f1f5f9;
+      --row-hover: #f1f5f9;
+      --table-head: #f8fafc;
+    }
+
+    * { box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow-x: hidden;
+      width: 100%;
+      background: var(--bg);
+      color: var(--text);
+      transition: background 0.25s, color 0.25s;
+    }
+
+    header {
+      background: linear-gradient(90deg, #09090b 0%, #141519 100%);
+      border-bottom: 2px solid #10b981;
+      color: #f8fafc;
+      padding: 16px 24px;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 14px;
+    }
+    .brand-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .brand h1 { margin: 0; font-size: 1.45rem; color: #10b981; letter-spacing: 0.5px; }
+    .brand p { margin: 6px 0 0; font-size: 0.85rem; color: #34d399; font-weight: 600; display: none; word-break: break-word; }
+    .header-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+    .upload-box {
+      background: #10b981;
+      color: #052e16;
+      padding: 10px 18px;
+      border-radius: 10px;
+      font-weight: 800;
+      font-size: 0.9rem;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      direction: ltr;
+      touch-action: manipulation;
+    }
+    .upload-box:hover { background: #34d399; }
+    .upload-box input { display: none; }
+
+    .theme-btn {
+      background: #1f2229;
+      color: #f4f4f5;
+      border: 1px solid #2e323c;
+      padding: 9px 14px;
+      border-radius: 10px;
+      font-size: 0.85rem;
+      font-weight: 700;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+
+    .container { max-width: 1360px; margin: 22px auto; padding: 0 16px; }
+
+    .alert-box {
+      background: #7f1d1d;
+      color: #fecaca;
+      border: 1px solid #ef4444;
+      padding: 12px 16px;
+      border-radius: 10px;
+      margin-bottom: 16px;
+      display: none;
+      font-weight: bold;
+    }
+
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    .kpi-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+      position: relative;
+      overflow: hidden;
+      transition: transform 0.15s, border-color 0.2s;
+    }
+    .kpi-card.clickable { cursor: pointer; }
+    .kpi-card.clickable:hover { border-color: #3b82f6; transform: translateY(-2px); }
+    .kpi-card::before { content: ""; position: absolute; top: 0; right: 0; left: 0; height: 4px; }
+    .kpi-card.in::before { background: #10b981; }
+    .kpi-card.cont::before { background: #3b82f6; }
+    .kpi-card.trans::before { background: #f59e0b; }
+    .kpi-card.self::before { background: #f43f5e; }
+
+    .kpi-title { font-size: 0.85rem; color: var(--muted); font-weight: 700; display: flex; justify-content: space-between; align-items: center; }
+    .kpi-val { font-size: 1.55rem; font-weight: 800; margin: 8px 0 4px; color: var(--text); }
+    .kpi-sub { font-size: 0.78rem; color: var(--muted); }
+
+    .charts-grid {
+      display: grid;
+      grid-template-columns: 1.3fr 1.1fr;
+      gap: 18px;
+      margin-bottom: 20px;
+    }
+    @media (max-width: 1024px) { .charts-grid { grid-template-columns: 1fr; } }
+    .chart-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+    }
+    .chart-title {
+      font-size: 1rem;
+      font-weight: 800;
+      color: var(--gold);
+      margin-bottom: 6px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .chart-hint {
+      font-size: 0.78rem;
+      color: var(--muted);
+      background: var(--input-bg);
+      padding: 3px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+    }
+    .chart-canvas-wrap {
+      position: relative;
+      height: 310px;
+      width: 100%;
+      margin-top: 10px;
+    }
+
+    .filter-panel {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 20px;
+      margin-bottom: 18px;
+    }
+    .filter-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 14px;
+      align-items: end;
+    }
+    label { display: block; font-size: 0.82rem; font-weight: 700; margin-bottom: 6px; color: var(--muted); }
+    input, select {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      font-size: 0.92rem;
+      background: var(--input-bg);
+      color: var(--text);
+    }
+    input:focus, select:focus { outline: none; border-color: var(--gold); }
+
+    .combobox-wrap { position: relative; }
+    .combobox-input-box { position: relative; display: flex; align-items: center; }
+    .combobox-input-box input { padding-left: 34px; }
+    .combobox-arrow {
+      position: absolute; left: 10px; cursor: pointer; color: var(--muted);
+      font-size: 0.8rem; user-select: none; padding: 6px;
+    }
+    .combobox-menu {
+      position: absolute; top: calc(100% + 4px); right: 0; left: 0;
+      max-height: 240px; overflow-y: auto; background: var(--card);
+      border: 1px solid var(--gold); border-radius: 10px;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.45); z-index: 999; display: none;
+    }
+    .combobox-menu.open { display: block; }
+    .combobox-item {
+      padding: 12px 14px; cursor: pointer; font-size: 0.92rem;
+      border-bottom: 1px solid var(--border); transition: background 0.15s;
+      touch-action: manipulation;
+    }
+    .combobox-item:last-child { border-bottom: none; }
+    .combobox-item:hover, .combobox-item:active { background: var(--gold-dim); color: var(--gold); font-weight: 700; }
+    .combobox-empty { padding: 12px; text-align: center; color: var(--muted); font-size: 0.85rem; }
+
+    .actions-bar {
+      display: flex; flex-wrap: wrap; gap: 12px; margin-top: 18px;
+      padding-top: 16px; border-top: 1px solid var(--border);
+      justify-content: space-between; align-items: center;
+    }
+    .btn-group { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .format-group {
+      display: inline-flex; align-items: center; background: var(--input-bg);
+      padding: 4px; border-radius: 11px; border: 1px solid var(--border); gap: 4px;
+    }
+    button {
+      border: none; padding: 10px 15px; border-radius: 9px; font-weight: 700;
+      font-size: 0.85rem; cursor: pointer; display: inline-flex;
+      align-items: center; gap: 6px; transition: transform 0.15s, opacity 0.15s;
+      touch-action: manipulation;
+    }
+    button:hover { opacity: 0.92; }
+    button:active { transform: scale(0.98); }
+    .btn-gold { background: #10b981; color: #052e16; }
+    .btn-wa-pdf { background: #dc2626; color: #fff; }
+    .btn-wa-excel { background: #16a34a; color: #fff; }
+    .btn-view { background: #1f2229; color: #f4f4f5; border: 1px solid #2e323c; }
+    .btn-reset { background: #1f2229; color: #f4f4f5; border: 1px solid #2e323c; }
+
+    .result-banner {
+      background: var(--gold-dim); border: 1px solid var(--gold); border-radius: 12px;
+      padding: 14px 18px; margin-bottom: 16px; display: flex;
+      flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px;
+    }
+    .result-banner strong { color: var(--gold); font-size: 1.08rem; }
+
+    .vehicle-summary-panel {
+      background: var(--card); border: 1px solid var(--border);
+      border-right: 4px solid var(--gold); border-radius: 12px;
+      padding: 16px 18px; margin-bottom: 18px; display: none;
+    }
+    .vehicle-summary-header {
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 12px; flex-wrap: wrap; gap: 8px;
+    }
+    .vehicle-summary-header h3 { margin: 0; font-size: 1rem; color: var(--gold); }
+    .vehicle-cards-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px;
+    }
+    .vehicle-card {
+      background: var(--input-bg); border: 1px solid var(--border);
+      border-radius: 10px; padding: 12px 14px; display: flex;
+      flex-direction: column; gap: 4px;
+    }
+    .vehicle-card-top { display: flex; justify-content: space-between; align-items: center; font-weight: 800; color: var(--text); font-size: 0.95rem; }
+    .vehicle-card-type { font-size: 0.78rem; color: var(--muted); }
+    .vehicle-card-qty { font-size: 1.15rem; font-weight: 800; color: var(--gold); margin-top: 4px; }
+    .vehicle-card-meta { font-size: 0.75rem; color: var(--muted); }
+
+    .table-wrap {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 14px; overflow-x: auto; -webkit-overflow-scrolling: touch;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    th {
+      background: var(--table-head); color: var(--gold); font-weight: 700;
+      padding: 13px 10px; text-align: right; border-bottom: 2px solid var(--border); white-space: nowrap;
+    }
+    td { padding: 11px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    tr:hover td { background: var(--row-hover); }
+    .badge { padding: 3px 9px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; }
+    .badge-cont { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
+    .badge-trans { background: rgba(16, 185, 129, 0.2); color: #34d399; }
+    .badge-self { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
+    .empty-state { text-align: center; padding: 45px 20px; color: var(--muted); }
+
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0, 0, 0, 0.78);
+      display: none; align-items: center; justify-content: center;
+      z-index: 9999; padding: 16px;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal-box {
+      background: var(--card); border: 1px solid var(--gold);
+      border-radius: 16px; width: 100%; max-width: 520px;
+      padding: 22px; box-shadow: 0 20px 40px rgba(0,0,0,0.6);
+      max-height: 92vh; display: flex; flex-direction: column;
+    }
+    .modal-box.modal-wide { max-width: 900px; }
+    .modal-header {
+      display: flex; justify-content: space-between; align-items: center;
+      border-bottom: 1px solid var(--border); padding-bottom: 12px; margin-bottom: 14px;
+    }
+    .modal-header h3 { margin: 0; color: var(--gold); font-size: 1.15rem; }
+    .modal-close {
+      background: transparent; color: var(--muted); font-size: 1.3rem; padding: 2px 8px;
+    }
+    .modal-body-scroll { overflow-y: auto; flex: 1; padding-left: 4px; }
+    .wa-preview-box {
+      width: 100%; height: 150px; background: var(--input-bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: 10px; padding: 12px;
+      font-size: 0.88rem; line-height: 1.6; resize: none; margin-bottom: 14px;
+    }
+    .wa-links-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .wa-link-btn {
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      padding: 12px; border-radius: 10px; text-decoration: none; font-weight: 800;
+      font-size: 0.9rem; text-align: center; cursor: pointer;
+    }
+    .wa-desktop { background: #25d366; color: #052e16; }
+    .wa-web { background: #059669; color: #ffffff; }
+    .wa-copy-btn {
+      width: 100%; background: #334155; color: #f8fafc; justify-content: center;
+      padding: 10px; margin-bottom: 10px; border-radius: 10px;
+    }
+    .wa-note { font-size: 0.8rem; color: var(--muted); margin-top: 12px; text-align: center; line-height: 1.5; }
+
+    .pdf-paper {
+      background: #ffffff; color: #0f172a; padding: 28px;
+      border-radius: 8px; direction: rtl; font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
+    }
+    .pdf-doc-header {
+      border-bottom: 3px solid #0f172a; padding-bottom: 16px; margin-bottom: 16px;
+      display: flex; justify-content: space-between; align-items: center; gap: 12px;
+    }
+    .pdf-brand-side {
+      display: flex; flex-direction: column; align-items: flex-start; min-width: 190px;
+    }
+    .pdf-brand-top {
+      display: flex; align-items: center; gap: 8px; direction: ltr;
+    }
+    .pdf-project-name {
+      font-size: 11.5px; color: #334155; font-weight: 700; margin-top: 5px;
+    }
+    .pdf-center-title {
+      flex: 1; text-align: center; display: flex; flex-direction: column; align-items: center;
+    }
+    .pdf-center-title h2 {
+      margin: 0; font-size: 24px; font-weight: 900; color: #0f172a;
+    }
+    .pdf-contractor-highlight {
+      margin-top: 6px; font-size: 16px; font-weight: 800; color: #b45309;
+      background: #fef3c7; border: 1px solid #f59e0b; padding: 3px 14px; border-radius: 6px;
+    }
+    .pdf-date-side {
+      text-align: left; font-size: 12px; color: #475569; min-width: 150px;
+    }
+    .pdf-doc-meta {
+      background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px;
+      padding: 12px 16px; margin-bottom: 18px; font-size: 13.5px;
+      display: flex; flex-wrap: wrap; justify-content: space-between; gap: 14px;
+    }
+    .pdf-section-title {
+      font-size: 15px; font-weight: 800; color: #0f172a; margin: 14px 0 8px;
+      page-break-after: avoid; break-after: avoid;
+    }
+    .pdf-table {
+      width: 100%; border-collapse: collapse; font-size: 11.5px; color: #0f172a;
+      page-break-inside: auto; break-inside: auto;
+    }
+    .pdf-table thead { display: table-header-group; }
+    .pdf-table tfoot { display: table-row-group; }
+    .pdf-table tr {
+      page-break-inside: avoid; break-inside: avoid;
+      page-break-after: auto; break-after: auto;
+    }
+    .pdf-table th { background: #0f172a; color: #ffffff; padding: 8px 6px; border: 1px solid #0f172a; text-align: right; }
+    .pdf-table td { padding: 7px 6px; border: 1px solid #cbd5e1; white-space: normal; }
+    .pdf-table tfoot td { background: #fef3c7; font-weight: bold; color: #0f172a; }
+
+    .excel-sheet-view { background: #ffffff; color: #0f172a; border-radius: 8px; overflow-x: auto; border: 1px solid #cbd5e1; }
+    .excel-sheet-view table { width: 100%; border-collapse: collapse; font-size: 12.5px; color: #0f172a; }
+    .excel-sheet-view th { background: #166534; color: #ffffff; border: 1px solid #14532d; padding: 9px 10px; }
+    .excel-sheet-view td { border: 1px solid #cbd5e1; padding: 7px 10px; color: #0f172a; }
+    .excel-sheet-view tr:nth-child(even) td { background: #f8fafc; }
+
+    #pdfTemplateContainer {
+      position: fixed; top: 0; left: 0; width: 794px;
+      background: #fff; color: #000; direction: rtl;
+      opacity: 0; pointer-events: none; z-index: -9999;
+    }
+
+    .login-overlay {
+      position: fixed; inset: 0;
+      background: radial-gradient(circle at top right, #141519 0%, #0a0a0c 55%, #050507 100%);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 100000; padding: 20px; overflow: hidden;
+      transition: background 0.35s ease;
+    }
+    .login-overlay::before {
+      content: ""; position: absolute; width: 380px; height: 380px;
+      background: radial-gradient(circle, rgba(16, 185, 129, 0.16) 0%, transparent 70%);
+      top: -80px; right: -80px; pointer-events: none;
+    }
+    .login-overlay::after {
+      content: ""; position: absolute; width: 320px; height: 320px;
+      background: radial-gradient(circle, rgba(59, 130, 246, 0.12) 0%, transparent 70%);
+      bottom: -80px; left: -80px; pointer-events: none;
+    }
+    .login-overlay.hidden { display: none; }
+
+    .login-card {
+      position: relative;
+      background: rgba(20, 21, 25, 0.88);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      border-top: 3px solid #10b981;
+      border-radius: 24px; width: 100%; max-width: 420px;
+      padding: 36px 30px 30px;
+      box-shadow: 0 30px 60px rgba(0, 0, 0, 0.8), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+      text-align: center;
+    }
+
+    .login-logo-ring {
+      width: 68px; height: 68px; margin: 0 auto 14px;
+      border-radius: 20px;
+      background: linear-gradient(145deg, rgba(16, 185, 129, 0.2), rgba(5, 150, 105, 0.08));
+      border: 1px solid rgba(16, 185, 129, 0.45);
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 10px 25px rgba(16, 185, 129, 0.2);
+    }
+    .login-card h2 {
+      margin: 0 0 6px; color: #10b981; font-size: 1.75rem; font-weight: 900; letter-spacing: 0.5px;
+    }
+    .login-project-badge {
+      display: inline-block;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.25);
+      color: #6ee7b7; font-size: 0.78rem; font-weight: 700;
+      padding: 5px 14px; border-radius: 999px; margin-bottom: 24px;
+    }
+    .login-field {
+      text-align: right; margin-bottom: 16px; position: relative;
+    }
+    .login-field label {
+      color: #cbd5e1; font-size: 0.83rem; font-weight: 700; margin-bottom: 7px; display: block;
+    }
+    .login-input-wrap {
+      position: relative; display: flex; align-items: center;
+    }
+    .login-input-icon {
+      position: absolute; right: 14px; color: #10b981; pointer-events: none;
+      display: flex; align-items: center;
+    }
+    .login-field input {
+      background: rgba(9, 13, 22, 0.85);
+      border: 1px solid #334155; color: #f8fafc;
+      padding: 13px 42px 13px 42px; border-radius: 12px; width: 100%; font-size: 0.96rem;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .login-field input:focus {
+      border-color: #10b981;
+      box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.18);
+      outline: none;
+    }
+    .toggle-pass-btn {
+      position: absolute; left: 10px; background: transparent; border: none;
+      color: #94a3b8; padding: 6px; cursor: pointer; font-size: 0.95rem;
+    }
+    .toggle-pass-btn:hover { color: #fbbf24; }
+    .login-err {
+      color: #fecaca; background: rgba(127, 29, 29, 0.75);
+      border: 1px solid #ef4444; border-radius: 10px;
+      padding: 10px 14px; font-size: 0.84rem; margin-bottom: 16px;
+      display: none; font-weight: 700;
+    }
+    .login-submit {
+      width: 100%; justify-content: center; padding: 14px;
+      font-size: 1.02rem; font-weight: 800; border-radius: 12px; margin-top: 8px;
+      background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+      color: #052e16;
+      box-shadow: 0 10px 22px rgba(16, 185, 129, 0.3);
+      transition: transform 0.15s, box-shadow 0.2s;
+    }
+    .login-submit:hover {
+      box-shadow: 0 14px 28px rgba(16, 185, 129, 0.45);
+      transform: translateY(-1px);
+    }
+    .login-footer-note {
+      margin-top: 20px; font-size: 0.76rem; color: #64748b;
+    }
+    .user-autocomplete-menu {
+      position: absolute; top: calc(100% + 6px); right: 0; left: 0;
+      background: #0f172a; border: 1px solid #f59e0b; border-radius: 12px;
+      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.75); z-index: 100001;
+      display: none; overflow: hidden;
+    }
+    .user-autocomplete-menu.open { display: block; }
+    .user-autocomplete-item {
+      padding: 11px 14px; cursor: pointer; font-size: 0.92rem;
+      color: #fbbf24; font-weight: 700; text-align: right;
+      border-bottom: 1px solid #1e293b;
+    }
+    .user-autocomplete-item:last-child { border-bottom: none; }
+    .user-autocomplete-item:hover { background: rgba(251, 191, 36, 0.16); }
+
+    @media (max-width: 640px) {
+      header { flex-direction: column; align-items: stretch; text-align: center; padding: 14px 16px; }
+      .brand-title { justify-content: center; }
+      .header-actions { justify-content: center; }
+      .header-actions > * { flex: 1 1 auto; justify-content: center; text-align: center; }
+      .filter-grid { grid-template-columns: 1fr; }
+      .actions-bar { flex-direction: column; align-items: stretch; }
+      .btn-group { flex-direction: column; width: 100%; }
+      .btn-group > button { width: 100%; justify-content: center; padding: 12px; }
+      .format-group { width: 100%; display: grid; grid-template-columns: 1fr 1fr; }
+      .format-group button { justify-content: center; padding: 11px 8px; font-size: 0.82rem; }
+      .wa-links-grid { grid-template-columns: 1fr; }
+      .login-card { padding: 28px 20px; }
+      .chart-canvas-wrap { height: 280px; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- شاشة تسجيل الدخول -->
+<div class="login-overlay" id="loginOverlay">
+  <div class="login-card">
+    <div class="login-logo-ring">
+      <svg width="38" height="38" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M18 5C18 5 9 14.8 9 21.2C9 26.1706 13.0294 30.2 18 30.2C22.9706 30.2 27 26.1706 27 21.2C27 14.8 18 5 18 5Z" fill="url(#loginFuelGrad)"/>
+        <path d="M14 21.5C14 23.7091 15.7909 25.5 18 25.5" stroke="#FFFBEB" stroke-width="2" stroke-linecap="round"/>
+        <defs>
+          <linearGradient id="loginFuelGrad" x1="18" y1="5" x2="18" y2="30.2" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#34D399"/>
+            <stop offset="1" stop-color="#059669"/>
+          </linearGradient>
+        </defs>
+      </svg>
+    </div>
+    <h2>Solar Report</h2>
+    <div class="login-project-badge">مستقبل مصر 400 ألف فدان - زون جي</div>
+    <div class="login-err" id="loginErrorMsg">⚠️ اسم المستخدم أو كلمة المرور غير صحيحة</div>
+    <form onsubmit="handleAppLogin(event)">
+      <div class="login-field">
+        <label>اسم المستخدم</label>
+        <div class="login-input-wrap">
+          <span class="login-input-icon">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          </span>
+          <input type="text" id="loginUser" placeholder="أدخل اسم المستخدم" required autocomplete="off" oninput="handleUsernameAutocomplete(event)" />
+        </div>
+        <div class="user-autocomplete-menu" id="userAutocompleteMenu"></div>
+      </div>
+      <div class="login-field">
+        <label>كلمة المرور</label>
+        <div class="login-input-wrap">
+          <span class="login-input-icon">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          </span>
+          <input type="password" id="loginPass" placeholder="••••••••" required autocomplete="current-password" />
+          <button type="button" class="toggle-pass-btn" onclick="toggleLoginPassword()" title="إظهار / إخفاء كلمة المرور" id="togglePassBtn">👁️</button>
+        </div>
+      </div>
+      <button type="submit" class="login-submit">تسجيل الدخول ←</button>
+    </form>
+    <div class="login-footer-note">نظام متابعة وإدارة مسحوبات السولار</div>
+  </div>
+</div>
+
+<header>
+  <div class="brand">
+    <div class="brand-title">
+      <svg width="32" height="32" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect width="36" height="36" rx="9" fill="rgba(16, 185, 129, 0.16)" stroke="#10B981" stroke-width="1.5"/>
+        <path d="M18 7C18 7 10 15.6 10 21.2C10 25.6183 13.5817 29.2 18 29.2C22.4183 29.2 26 25.6183 26 21.2C26 15.6 18 7 18 7Z" fill="url(#fuelGrad)"/>
+        <path d="M14.5 21.5C14.5 23.433 16.067 25 18 25" stroke="#FFFBEB" stroke-width="1.8" stroke-linecap="round"/>
+        <defs>
+          <linearGradient id="fuelGrad" x1="18" y1="7" x2="18" y2="29.2" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#34D399"/>
+            <stop offset="1" stop-color="#059669"/>
+          </linearGradient>
+        </defs>
+      </svg>
+      <h1>Solar Report</h1>
+    </div>
+    <p id="fileStatus"></p>
+  </div>
+  <div class="header-actions">
+    <button type="button" class="theme-btn" onclick="handleDirectRefresh()" title="تحديث وجلب آخر شيت مرفوع">🔄 تحديث</button>
+    <button type="button" class="theme-btn" onclick="toggleTheme()" id="themeBtn">☀️ الوضع النهاري</button>
+    <label class="upload-box">
+      <span>📂 Upload File</span>
+      <input type="file" id="excelInput" accept="*/*" />
+    </label>
+    <button type="button" class="theme-btn" onclick="handleAppLogout()" title="قفل التطبيق وتسجيل الخروج">🔒 خروج</button>
+  </div>
+</header>
+
+<div class="container">
+  <div class="alert-box" id="errorBox"></div>
+
+  <!-- الأرصدة الأربعة المعتمدة من صفحة WTR -->
+  <div class="kpi-grid">
+    <div class="kpi-card in clickable" onclick="openIncomingAuditModal()" title="اضغط لمراجعة تفاصيل الوارد من صفحة WTR">
+      <div class="kpi-title">
+        <span>📥 الوارد (WTR)</span>
+        <span style="font-size:0.72rem; color:#60a5fa;">🔍 فحص</span>
+      </div>
+      <div class="kpi-val" id="kpiIn">0 لتر</div>
+      <div class="kpi-sub" id="kpiInCount">0 إذن وارد (مشتريات + تحويل)</div>
+    </div>
+    <div class="kpi-card cont">
+      <div class="kpi-title">🚜 صرف بالخصم (WTR)</div>
+      <div class="kpi-val" id="kpiCont">0 لتر</div>
+      <div class="kpi-sub" id="kpiContCount">0 حركة صرف بالخصم / للغير</div>
+    </div>
+    <div class="kpi-card trans">
+      <div class="kpi-title">🚛 صرف تشغيل - إدارة النقل (WTR)</div>
+      <div class="kpi-val" id="kpiTrans">0 لتر</div>
+      <div class="kpi-sub" id="kpiTransCount">0 حركة لإدارة النقل</div>
+    </div>
+    <div class="kpi-card self">
+      <div class="kpi-title">⚙️ صرف تشغيل - موقع (WTR)</div>
+      <div class="kpi-val" id="kpiSelf">0 لتر</div>
+      <div class="kpi-sub" id="kpiSelfCount">0 حركة تشغيل موقع</div>
+    </div>
+  </div>
+
+  <!-- الرسوم البيانية المعتمدة من صفحة WTR -->
+  <div class="charts-grid">
+    <div class="chart-card">
+      <div class="chart-title">
+        <span>📊 أعلى 10 مقاولين سحباً للسولار (صرف للغير - WTR)</span>
+        <span class="chart-hint">💡 الكمية والنسبة لكل مقاول</span>
+      </div>
+      <div class="chart-canvas-wrap">
+        <canvas id="topContractorsChart"></canvas>
+      </div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">
+        <span>📈 توزيع المنصرف (WTR)</span>
+        <span class="chart-hint" id="totalDisbursedHint">إجمالي المنصرف: 0 لتر</span>
+      </div>
+      <div class="chart-canvas-wrap">
+        <canvas id="distributionChart"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- مربعات البحث الخمسة المعتمدة على صفحتي "مقاولين" و "ذاتي" -->
+  <div class="filter-panel">
+    <div class="filter-grid">
+      <div>
+        <label>نوع المنصرف (شيت مقاولين / ذاتي)</label>
+        <select id="sheetFilter" onchange="onSheetFilterChange()">
+          <option value="all">الكل (مقاولين + ذاتي)</option>
+          <option value="contractors">مقاولين</option>
+          <option value="self">ذاتي</option>
+        </select>
+      </div>
+      <div>
+        <label>يصرف إلى / اسم المقاول (كتابة أو اختيار)</label>
+        <div class="combobox-wrap" id="contractorCombobox">
+          <div class="combobox-input-box">
+            <input type="text" id="contractorInput" placeholder="اكتب أو اختر المقاول / الجهة..." autocomplete="off" />
+            <span class="combobox-arrow" id="comboboxArrow">▼</span>
+          </div>
+          <div class="combobox-menu" id="contractorMenu"></div>
+        </div>
+      </div>
+      <div>
+        <label>من تاريخ</label>
+        <input type="date" id="dateFrom" onchange="applyFilters()" />
+      </div>
+      <div>
+        <label>إلى تاريخ</label>
+        <input type="date" id="dateTo" onchange="applyFilters()" />
+      </div>
+      <div>
+        <label>رقم السيارة / المعدة</label>
+        <input type="text" id="vehicleInput" placeholder="اختياري..." oninput="applyFilters()" />
+      </div>
+    </div>
+
+    <div class="actions-bar">
+      <div class="btn-group">
+        <button type="button" class="btn-gold" onclick="applyFilters()">🔍 عرض المسحوبات</button>
+        <button type="button" class="btn-reset" onclick="resetFilters()">🔄 إعادة ضبط</button>
+      </div>
+      <div class="btn-group">
+        <div class="format-group">
+          <button type="button" class="btn-wa-pdf" id="btnShareWaPdf" onclick="sharePDFOnWhatsApp()">📲 مشاركة PDF واتساب</button>
+          <button type="button" class="btn-view" onclick="openPdfPreviewModal()">👁️ عرض PDF</button>
+        </div>
+        <div class="format-group">
+          <button type="button" class="btn-wa-excel" onclick="shareExcelOnWhatsApp()">📊 مشاركة Excel واتساب</button>
+          <button type="button" class="btn-view" onclick="openExcelPreviewModal()">👁️ عرض Excel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="result-banner" id="resultBanner" style="display:none;">
+    <div id="filterSummaryText"></div>
+    <div>إجمالي مسحوبات الفترة: <strong id="filteredTotalQty">0 لتر</strong> (<span id="filteredRowsCount">0</span> حركة)</div>
+  </div>
+
+  <div class="vehicle-summary-panel" id="vehicleSummaryPanel">
+    <div class="vehicle-summary-header">
+      <h3 id="vehicleSummaryTitle">🚜 ملخص مسحوبات كل سيارة / معدة</h3>
+      <span id="vehicleSummarySubtitle" style="font-size:0.82rem; color:var(--muted);"></span>
+    </div>
+    <div class="vehicle-cards-grid" id="vehicleCardsGrid"></div>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>م</th>
+          <th>الجهة</th>
+          <th>التاريخ</th>
+          <th>المقاول</th>
+          <th>رقم المعدة</th>
+          <th>الكمية ( لتر )</th>
+          <th>رقم الاذن</th>
+          <th>المستلم</th>
+          <th>ملاحظات</th>
+        </tr>
+      </thead>
+      <tbody id="tableBody">
+        <tr>
+          <td colspan="9" class="empty-state">
+            ⬆️ اضغط على زر <b>Upload File</b> بالأعلى لرفع ملف الإكسيل والبدء
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- نافذة فحص تفاصيل الوارد (WTR) -->
+<div class="modal-overlay" id="incomingAuditModal" onclick="if(event.target===this) closeIncomingAuditModal()">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h3>📥 تفاصيل أذون الوارد المقروءة من صفحة WTR</h3>
+      <button type="button" class="modal-close" onclick="closeIncomingAuditModal()">✕</button>
+    </div>
+    <div id="incomingAuditSummary" style="background:var(--input-bg); border:1px solid var(--border); border-radius:10px; padding:12px; margin-bottom:12px; font-size:0.88rem; line-height:1.6;"></div>
+    <div class="modal-body-scroll" id="incomingAuditBody"></div>
+  </div>
+</div>
+
+<!-- نافذة مشاركة واتساب التفاعلية -->
+<div class="modal-overlay" id="waModal" onclick="if(event.target===this) closeWaModal()">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h3 id="waModalTitle">📲 مشاركة التقرير عبر واتساب</h3>
+      <button type="button" class="modal-close" onclick="closeWaModal()">✕</button>
+    </div>
+    <p id="waModalSubtitle" style="font-size:0.85rem; color:var(--muted); margin:0 0 10px;"></p>
+    <div style="margin-bottom:12px;">
+      <label style="font-size:0.8rem; color:var(--gold);">📱 رقم الواتساب (اختياري - لإرساله مباشرة أو اتركه فارغاً لاختيار جهة الاتصال من التطبيق):</label>
+      <input type="tel" id="waTargetPhone" placeholder="مثال: 01012345678" oninput="updateWhatsAppDirectLinks()" style="direction:ltr; text-align:right; margin-top:4px;" />
+    </div>
+    <textarea class="wa-preview-box" id="waTextPreview" readonly></textarea>
+    <button type="button" class="wa-copy-btn" id="waCopyBtn" onclick="copyWaTextManual()">📋 نسخ النص مرة أخرى</button>
+    <div class="wa-links-grid">
+      <a id="waDesktopLink" href="#" class="wa-link-btn wa-desktop">💻 فتح تطبيق واتساب الكمبيوتر</a>
+      <a id="waWebLink" href="#" target="_blank" rel="noopener noreferrer" class="wa-link-btn wa-web">🌐 واتساب ويب (Web)</a>
+    </div>
+    <div class="wa-note" id="waFileNote"></div>
+  </div>
+</div>
+
+<!-- نافذة عرض PDF داخل التطبيق -->
+<div class="modal-overlay" id="pdfPreviewModal" onclick="if(event.target===this) closePdfPreviewModal()">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h3>📄 معاينة التقرير (PDF)</h3>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button type="button" class="btn-wa-pdf" onclick="closePdfPreviewModal(); sharePDFOnWhatsApp();">📲 مشاركة PDF واتساب</button>
+        <button type="button" class="modal-close" onclick="closePdfPreviewModal()">✕</button>
+      </div>
+    </div>
+    <div class="modal-body-scroll" id="pdfPreviewContent"></div>
+  </div>
+</div>
+
+<!-- نافذة عرض Excel داخل التطبيق -->
+<div class="modal-overlay" id="excelPreviewModal" onclick="if(event.target===this) closeExcelPreviewModal()">
+  <div class="modal-box modal-wide">
+    <div class="modal-header">
+      <h3>📊 معاينة جدول الإكسيل (Excel)</h3>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button type="button" class="btn-wa-excel" onclick="closeExcelPreviewModal(); shareExcelOnWhatsApp();">📊 مشاركة Excel واتساب</button>
+        <button type="button" class="modal-close" onclick="closeExcelPreviewModal()">✕</button>
+      </div>
+    </div>
+    <div class="modal-body-scroll" id="excelPreviewContent"></div>
+  </div>
+</div>
+
+<!-- نافذة مزامنة الموبايل -->
+<div class="modal-overlay" id="syncModal" onclick="if(event.target===this) closeMobileSyncModal()">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h3>🔄 تحديث البيانات</h3>
+      <button type="button" class="modal-close" onclick="closeMobileSyncModal()">✕</button>
+    </div>
+    <p style="font-size:0.88rem; color:var(--muted); line-height:1.6; margin-top:0;">
+      لفتح آخر شيت تم رفعه من الكمبيوتر على هاتفك المحمول فوراً، أدخل <b>كود المزامنة</b> الذي ظهر لك عند رفع الملف على الكمبيوتر (أو ارفع ملف الإكسيل هنا مرة واحدة وسيُحفظ في ذاكرة الهاتف دائماً):
+    </p>
+    <div style="display:flex; gap:8px; margin-bottom:14px;">
+      <input type="text" id="mobileSyncCodeInput" placeholder="مثال: SR-1234" style="text-align:center; font-weight:800; letter-spacing:1px; text-transform:uppercase;" />
+      <button type="button" class="btn-gold" onclick="triggerMobileSync()">🔄 جلب الشيت</button>
+    </div>
+    <div id="currentSyncCodeBox" style="background:var(--input-bg); border:1px solid var(--border); border-radius:10px; padding:12px; font-size:0.85rem; text-align:center; color:var(--text);"></div>
+  </div>
+</div>
+
+<div id="pdfTemplateContainer"></div>
+
+<script>
+  const APP_CREDENTIALS = {
+    username: 'M.salah',
+    password: '123456'
+  };
+
+  function getSavedUsernames() {
+    try {
+      const raw = localStorage.getItem('solar_saved_usernames');
+      const list = raw ? JSON.parse(raw) : [];
+      return Array.isArray(list) ? list : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveUsernameSuggestion(name) {
+    if (!name) return;
+    try {
+      const list = getSavedUsernames().filter(u => u.toLowerCase() !== name.toLowerCase());
+      list.unshift(name);
+      localStorage.setItem('solar_saved_usernames', JSON.stringify(list.slice(0, 5)));
+    } catch (e) {}
+  }
+
+  function handleUsernameAutocomplete(e) {
+    const input = e.target;
+    const val = input.value.trim();
+    const menu = document.getElementById('userAutocompleteMenu');
+    if (!val) {
+      if (menu) menu.classList.remove('open');
+      return;
+    }
+    const list = getSavedUsernames();
+    const matches = list.filter(u => u.toLowerCase().startsWith(val.toLowerCase()));
+
+    if (matches.length > 0 && e.inputType && !e.inputType.startsWith('delete')) {
+      const topMatch = matches[0];
+      if (topMatch.toLowerCase() !== val.toLowerCase()) {
+        input.value = topMatch;
+        input.setSelectionRange(val.length, topMatch.length);
+      }
+    }
+
+    if (menu) {
+      if (matches.length > 0) {
+        menu.innerHTML = matches.map(u =>
+          `<div class="user-autocomplete-item" onpointerdown="selectSuggestedUser('${u.replace(/'/g, "\\'")}')">👤 ${u}</div>`
+        ).join('');
+        menu.classList.add('open');
+      } else {
+        menu.classList.remove('open');
+      }
+    }
+  }
+
+  function selectSuggestedUser(name) {
+    document.getElementById('loginUser').value = name;
+    const menu = document.getElementById('userAutocompleteMenu');
+    if (menu) menu.classList.remove('open');
+    document.getElementById('loginPass').focus();
+  }
+
+  function toggleLoginPassword() {
+    const passInput = document.getElementById('loginPass');
+    const btn = document.getElementById('togglePassBtn');
+    if (passInput.type === 'password') {
+      passInput.type = 'text';
+      btn.textContent = '🙈';
+    } else {
+      passInput.type = 'password';
+      btn.textContent = '👁️';
+    }
+  }
+
+  function handleAppLogin(e) {
+    e.preventDefault();
+    const userVal = document.getElementById('loginUser').value.trim();
+    const passVal = document.getElementById('loginPass').value;
+    const errEl = document.getElementById('loginErrorMsg');
+
+    if (userVal.toLowerCase() === APP_CREDENTIALS.username.toLowerCase() && passVal === APP_CREDENTIALS.password) {
+      saveUsernameSuggestion(APP_CREDENTIALS.username);
+      errEl.style.display = 'none';
+      document.getElementById('loginOverlay').classList.add('hidden');
+      try { sessionStorage.setItem('solar_logged_in', '1'); } catch (err) {}
+    } else {
+      errEl.style.display = 'block';
+    }
+  }
+
+  function handleAppLogout() {
+    try { sessionStorage.removeItem('solar_logged_in'); } catch (err) {}
+    document.getElementById('loginPass').value = '';
+    document.getElementById('loginErrorMsg').style.display = 'none';
+    document.getElementById('loginOverlay').classList.remove('hidden');
+  }
+
+  (function checkLoginSession() {
+    try {
+      if (sessionStorage.getItem('solar_logged_in') === '1') {
+        document.getElementById('loginOverlay').classList.add('hidden');
+      }
+    } catch (err) {}
+  })();
+
+  // المتغيرات العامة للبيانات
+  let wtrRecords = [];        // بيانات صفحة WTR للمربعات الأربعة والرسوم البيانية
+  let sheetRecords = [];      // بيانات صفحتي (مقاولين + ذاتي) لمربعات البحث والجدول
+  let filteredRecords = [];
+  let incomingRowsList = [];
+  let totalIncomingQty = 0;
+  let totalIncomingCount = 0;
+  let allContractors = [];
+  let topChartInstance = null;
+  let distChartInstance = null;
+
+  function formatNumber(num) {
+    return Number(num || 0).toLocaleString('en-US', { maximumFractionDigits: 2 });
+  }
+
+  function normalizeArabic(str) {
+    return String(str || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[أإآ]/g, 'ا')
+      .replace(/ى/g, 'ي')
+      .replace(/ة/g, 'ه')
+      .replace(/\s+/g, ' ');
+  }
+
+  function parseCleanNumber(rawVal) {
+    if (typeof rawVal === 'number') return isFinite(rawVal) ? rawVal : NaN;
+    if (rawVal === null || rawVal === undefined) return NaN;
+    let str = String(rawVal).trim();
+    if (!str) return NaN;
+    const arabicDigits = '٠١٢٣٤٥٦٧٨٩';
+    str = str.replace(/[٠-٩]/g, d => arabicDigits.indexOf(d));
+    str = str.replace(/[^\d.,-]/g, '');
+    if (!str) return NaN;
+    str = str.replace(/,/g, '');
+    const num = parseFloat(str);
+    return isFinite(num) ? num : NaN;
+  }
+
+  function showError(msg) {
+    const box = document.getElementById('errorBox');
+    if (!box) return;
+    box.textContent = '⚠️ ' + msg;
+    box.style.display = 'block';
+    setTimeout(() => { box.style.display = 'none'; }, 6000);
+  }
+
+  function toggleTheme() {
+    document.body.classList.toggle('light-mode');
+    const isLight = document.body.classList.contains('light-mode');
+    document.getElementById('themeBtn').textContent = isLight ? '🌙 الوضع الليلي' : '☀️ الوضع النهاري';
+    try { localStorage.setItem('solar_theme_light', isLight ? '1' : '0'); } catch (e) {}
+    if (wtrRecords.length > 0) renderCharts();
+  }
+
+  (function restoreTheme() {
+    try {
+      if (localStorage.getItem('solar_theme_light') === '1') {
+        document.body.classList.add('light-mode');
+        const btn = document.getElementById('themeBtn');
+        if (btn) btn.textContent = '🌙 الوضع الليلي';
+      }
+    } catch (e) {}
+  })();
+
+  function handleDirectRefresh() {
+    if (typeof window.syncFromMobileCode === 'function') {
+      window.syncFromMobileCode();
+    }
+  }
+
+  function closeMobileSyncModal() {
+    const modal = document.getElementById('syncModal');
+    if (modal) modal.classList.remove('open');
+  }
+
+  function triggerMobileSync() {
+    const code = document.getElementById('mobileSyncCodeInput').value.trim();
+    if (typeof window.syncFromMobileCode === 'function') {
+      window.syncFromMobileCode(code);
+    }
+    closeMobileSyncModal();
+  }
+
+  function parseExcelDate(val) {
+    if (val === null || val === undefined || val === '') return '';
+    if (typeof val === 'number') {
+      const utcDays = Math.floor(val - 25569);
+      const d = new Date(utcDays * 86400 * 1000);
+      if (!isNaN(d.getTime())) return d.toISOString().split('T')[0];
+    }
+    if (val instanceof Date && !isNaN(val.getTime())) {
+      return val.toISOString().split('T')[0];
+    }
+    const str = String(val).trim();
+    const isoMatch = str.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
+    if (isoMatch) {
+      return `${isoMatch[1]}-${isoMatch[2].padStart(2, '0')}-${isoMatch[3].padStart(2, '0')}`;
+    }
+    const dmyMatch = str.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})/);
+    if (dmyMatch) {
+      return `${dmyMatch[3]}-${dmyMatch[2].padStart(2, '0')}-${dmyMatch[1].padStart(2, '0')}`;
+    }
+    return '';
+  }
+
+  // اكتشاف أعمدة صفحة WTR
+  function detectWTRColumns(rows) {
+    let headerRowIdx = 0;
+    let map = {
+      date: -1,
+      ledger: -1,
+      permitType: -1,
+      issuedTo: -1,
+      vehicle: -1,
+      equip: -1,
+      qty: -1,
+      bookNo: -1,
+      receiver: -1,
+      notes: -1
+    };
+
+    for (let i = 0; i < Math.min(rows.length, 20); i++) {
+      const row = rows[i] || [];
+      const rowStr = row.map(c => normalizeArabic(c));
+      const hasQty = rowStr.some(c => c.includes('كميه') || c.includes('لتر'));
+      const hasLedgerOrPermit = rowStr.some(c => c.includes('دفتر') || c.includes('نوع الاذن') || c.includes('يصرف') || c.includes('حركه'));
+
+      if (hasQty && hasLedgerOrPermit) {
+        headerRowIdx = i;
+        rowStr.forEach((col, idx) => {
+          if (!col) return;
+          if (col.includes('تاريخ')) map.date = idx;
+          else if (col === 'الدفتر' || col === 'دفتر' || (col.includes('دفتر') && !col.includes('رقم'))) map.ledger = idx;
+          else if (col.includes('نوع الاذن') || col.includes('نوع اذن') || col.includes('نوع الحركه')) map.permitType = idx;
+          else if (col.includes('يصرف الي') || col.includes('يصرف ل') || col.includes('مقاول') || col.includes('الجهه')) map.issuedTo = idx;
+          else if (col.includes('سياره') || col.includes('لوحه') || col.includes('كود')) map.vehicle = idx;
+          else if (col.includes('معده') || col.includes('نوع المعده')) map.equip = idx;
+          else if ((col === 'الكميه' || col === 'كميه' || col.includes('كميه')) && !col.includes('رصيد') && !col.includes('تراكم') && !col.includes('متبقي')) {
+            if (map.qty === -1 || col === 'الكميه' || col === 'كميه') map.qty = idx;
+          }
+          else if (col.includes('رقم الاذن') || col.includes('رقم الدفتر') || col.includes('بون')) map.bookNo = idx;
+          else if (col.includes('مستلم') || col.includes('سائق')) map.receiver = idx;
+          else if (col.includes('ملاحظ')) map.notes = idx;
+        });
+        break;
+      }
+    }
+    return { headerRowIdx, map };
+  }
+
+  // اكتشاف أعمدة صفحتي "مقاولين" و "ذاتي"
+  function detectDetailSheetColumns(rows) {
+    let headerRowIdx = 0;
+    let map = {
+      date: -1,
+      contractor: -1,
+      vehicle: -1,
+      equip: -1,
+      qty: -1,
+      bookNo: -1,
+      receiver: -1,
+      notes: -1
+    };
+
+    for (let i = 0; i < Math.min(rows.length, 20); i++) {
+      const row = rows[i] || [];
+      const rowStr = row.map(c => normalizeArabic(c));
+      const hasQty = rowStr.some(c => c.includes('كميه') || c.includes('لتر'));
+      const hasContext = rowStr.some(c =>
+        c.includes('تاريخ') || c.includes('مقاول') || c.includes('يصرف') ||
+        c.includes('سياره') || c.includes('معده') || c.includes('جهه')
+      );
+
+      if (hasQty && hasContext) {
+        headerRowIdx = i;
+        rowStr.forEach((col, idx) => {
+          if (!col) return;
+          if (col.includes('تاريخ')) map.date = idx;
+          else if (col.includes('يصرف الي') || col.includes('يصرف ل') || col.includes('مقاول') || col.includes('الجهه') || col.includes('اسم العميل')) map.contractor = idx;
+          else if (col.includes('رقم السياره') || col.includes('سياره') || col.includes('لوحه') || col.includes('كود') || col.includes('رقم المعده')) map.vehicle = idx;
+          else if (col.includes('اسم المعده') || col.includes('نوع المعده') || (col.includes('معده') && map.vehicle !== idx)) map.equip = idx;
+          else if ((col === 'الكميه' || col === 'كميه' || col.includes('كميه') || col.includes('لتر')) && !col.includes('رصيد') && !col.includes('تراكم') && !col.includes('متبقي')) {
+            if (map.qty === -1 || col === 'الكميه' || col === 'كميه') map.qty = idx;
+          }
+          else if (col.includes('رقم الاذن') || col.includes('رقم الدفتر') || col.includes('بون') || col.includes('اذن')) map.bookNo = idx;
+          else if (col.includes('مستلم') || col.includes('سائق')) map.receiver = idx;
+          else if (col.includes('ملاحظ')) map.notes = idx;
+        });
+        break;
+      }
+    }
+    return { headerRowIdx, map };
+  }
+
+  // قراءة وتحليل شيت "مقاولين" أو "ذاتي"
+  function parseDetailSheet(wb, targetKeywords, recordType, sheetLabel, defaultContractorName) {
+    const matchedSheetName = wb.SheetNames.find(name => {
+      const n = normalizeArabic(name);
+      return targetKeywords.some(kw => n.includes(kw));
+    });
+
+    if (!matchedSheetName) return { records: [], sheetName: null };
+
+    const sheet = wb.Sheets[matchedSheetName];
+    const rowsMeta = sheet['!rows'] || [];
+    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: true });
+    const { headerRowIdx, map } = detectDetailSheetColumns(rows);
+
+    if (map.qty === -1) return { records: [], sheetName: matchedSheetName };
+
+    const parsed = [];
+    rows.forEach((r, idx) => {
+      if (idx <= headerRowIdx) return;
+      if (rowsMeta[idx] && rowsMeta[idx].hidden) return;
+
+      const qty = parseCleanNumber(r[map.qty]);
+      if (isNaN(qty) || qty <= 0) return;
+
+      const contractorRaw = map.contractor !== -1 ? String(r[map.contractor] || '').trim() : '';
+      const contractorNorm = normalizeArabic(contractorRaw);
+      const vehicleRaw = map.vehicle !== -1 ? String(r[map.vehicle] || '').trim() : '';
+      const vehicleNorm = normalizeArabic(vehicleRaw);
+
+      if (
+        contractorNorm.includes('اجمالي') || contractorNorm.includes('مجموع') || contractorNorm.includes('رصيد') ||
+        vehicleNorm.includes('اجمالي') || vehicleNorm.includes('مجموع')
+      ) {
+        return;
+      }
+
+      parsed.push({
+        type: recordType,
+        sheetLabel: sheetLabel,
+        date: map.date !== -1 ? parseExcelDate(r[map.date]) : '',
+        contractor: contractorRaw || defaultContractorName,
+        vehicle: vehicleRaw || '-',
+        equip: map.equip !== -1 ? (String(r[map.equip] || '-').trim() || '-') : '-',
+        qty: qty,
+        book: map.bookNo !== -1 ? (String(r[map.bookNo] || '-').trim() || '-') : '-',
+        receiver: map.receiver !== -1 ? (String(r[map.receiver] || '-').trim() || '-') : '-',
+        notes: map.notes !== -1 ? (String(r[map.notes] || '-').trim() || '-') : '-'
+      });
+    });
+
+    return { records: parsed, sheetName: matchedSheetName };
+  }
+
+  document.getElementById('excelInput').addEventListener('change', function(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (!/\.(xlsx|xls|xlsm|csv)$/i.test(file.name)) {
+      showError('يرجى اختيار ملف إكسيل بصيغة .xlsx أو .xls');
+      e.target.value = '';
+      return;
+    }
+    if (typeof XLSX === 'undefined') {
+      showError('مكتبة قراءة الإكسيل قيد التحميل، يرجى المحاولة بعد ثوانٍ.');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = function(evt) {
+      try {
+        const data = new Uint8Array(evt.target.result);
+        const wb = XLSX.read(data, { type: 'array' });
+
+        // 1. قراءة صفحة WTR للمربعات الأربعة والرسوم البيانية
+        const wtrName = wb.SheetNames.find(n => n.trim().toUpperCase() === 'WTR') || wb.SheetNames[0];
+        const wtrSheet = wb.Sheets[wtrName];
+        const wtrRowsMeta = wtrSheet['!rows'] || [];
+        const rows = XLSX.utils.sheet_to_json(wtrSheet, { header: 1, defval: '', raw: true });
+
+        const { headerRowIdx, map } = detectWTRColumns(rows);
+
+        if (map.qty === -1) {
+          showError('تعذر العثور على عمود "الكمية" في صفحة WTR.');
+          return;
+        }
+
+        const parsedWtrRecords = [];
+        const parsedIncomingRows = [];
+        let inQty = 0;
+        let inCount = 0;
+
+        rows.forEach((r, idx) => {
+          if (idx <= headerRowIdx) return;
+          if (wtrRowsMeta[idx] && wtrRowsMeta[idx].hidden) return;
+
+          const qty = parseCleanNumber(r[map.qty]);
+          if (isNaN(qty) || qty <= 0) return;
+
+          const ledgerRaw = map.ledger !== -1 ? String(r[map.ledger] || '').trim() : '';
+          const permitRaw = map.permitType !== -1 ? String(r[map.permitType] || '').trim() : '';
+          const ledgerVal = normalizeArabic(ledgerRaw);
+          const permitVal = normalizeArabic(permitRaw);
+          const issuedToRaw = map.issuedTo !== -1 ? String(r[map.issuedTo] || '').trim() : '';
+          const issuedToNorm = normalizeArabic(issuedToRaw);
+
+          const isHeaderSummary =
+            ledgerVal.includes('اجمالي') || ledgerVal.includes('مجموع') || ledgerVal.includes('رصيد') ||
+            permitVal.includes('اجمالي') || permitVal.includes('مجموع') || permitVal.includes('رصيد') ||
+            issuedToNorm.includes('اجمالي') || issuedToNorm.includes('مجموع');
+          if (isHeaderSummary) return;
+
+          // الوارد من WTR: عمود الدفتر = "وارد" و نوع الإذن يحتوي على "مشتريات" أو "تحويل"
+          const isLedgerIncoming = (ledgerVal === 'وارد');
+          const isPermitIncoming = (permitVal.includes('مشتريات') || permitVal.includes('تحويل'));
+
+          if (isLedgerIncoming && isPermitIncoming) {
+            inQty += qty;
+            inCount++;
+            parsedIncomingRows.push({
+              excelRow: idx + 1,
+              date: map.date !== -1 ? parseExcelDate(r[map.date]) : '-',
+              ledger: ledgerRaw,
+              permit: permitRaw,
+              source: issuedToRaw || '-',
+              qty: qty,
+              book: map.bookNo !== -1 ? (String(r[map.bookNo] || '-').trim() || '-') : '-'
+            });
+            return;
+          }
+
+          if (ledgerVal === 'وارد' || ledgerVal.includes('وارد')) return;
+
+          const isOperation = permitVal.includes('تشغيل') || ledgerVal.includes('تشغيل');
+          const isExplicitDeduction =
+            permitVal.includes('صرف للغير') ||
+            permitVal.includes('للغير') ||
+            permitVal.includes('خصم') ||
+            ledgerVal.includes('صرف للغير') ||
+            ledgerVal.includes('خصم');
+
+          if (isOperation && !isExplicitDeduction) {
+            const isTransport = issuedToNorm.includes('اداره النقل') || issuedToNorm.includes('ادارة النقل') || issuedToNorm.includes('نقل');
+            parsedWtrRecords.push({
+              type: isTransport ? 'transport' : 'self',
+              sheetLabel: isTransport ? 'صرف تشغيل - إدارة النقل' : 'صرف تشغيل - موقع',
+              date: map.date !== -1 ? parseExcelDate(r[map.date]) : '',
+              contractor: issuedToRaw || (isTransport ? 'إدارة النقل' : 'موقع'),
+              vehicle: map.vehicle !== -1 ? (String(r[map.vehicle] || '-').trim() || '-') : '-',
+              equip: map.equip !== -1 ? (String(r[map.equip] || '-').trim() || '-') : '-',
+              qty: qty,
+              book: map.bookNo !== -1 ? (String(r[map.bookNo] || '-').trim() || '-') : '-',
+              receiver: map.receiver !== -1 ? (String(r[map.receiver] || '-').trim() || '-') : '-',
+              notes: map.notes !== -1 ? (String(r[map.notes] || '-').trim() || '-') : '-'
+            });
+          } else {
+            parsedWtrRecords.push({
+              type: 'contractors',
+              sheetLabel: 'صرف بالخصم',
+              date: map.date !== -1 ? parseExcelDate(r[map.date]) : '',
+              contractor: issuedToRaw || 'صرف بالخصم',
+              vehicle: map.vehicle !== -1 ? (String(r[map.vehicle] || '-').trim() || '-') : '-',
+              equip: map.equip !== -1 ? (String(r[map.equip] || '-').trim() || '-') : '-',
+              qty: qty,
+              book: map.bookNo !== -1 ? (String(r[map.bookNo] || '-').trim() || '-') : '-',
+              receiver: map.receiver !== -1 ? (String(r[map.receiver] || '-').trim() || '-') : '-',
+              notes: map.notes !== -1 ? (String(r[map.notes] || '-').trim() || '-') : '-'
+            });
+          }
+        });
+
+        // 2. قراءة صفحتي "مقاولين" و "ذاتي" لمربعات البحث الخمسة والجدول
+        const contractorsSheetRes = parseDetailSheet(wb, ['مقاولين', 'المقاولين', 'مقاول'], 'contractors', 'مقاولين', 'مقاول');
+        const selfSheetRes = parseDetailSheet(wb, ['ذاتي', 'الذاتي', 'تشغيل ذاتي'], 'self', 'ذاتي', 'تشغيل ذاتي');
+
+        let combinedDetailRecords = [
+          ...contractorsSheetRes.records,
+          ...selfSheetRes.records
+        ];
+
+        const loadedSheetsNames = [wtrName];
+        if (contractorsSheetRes.sheetName) loadedSheetsNames.push(contractorsSheetRes.sheetName);
+        if (selfSheetRes.sheetName) loadedSheetsNames.push(selfSheetRes.sheetName);
+
+        if (combinedDetailRecords.length === 0) {
+          showError('تنبيه: لم يتم العثور على بيانات في صفحتي "مقاولين" أو "ذاتي" داخل الملف.');
+        }
+
+        const payload = {
+          fileName: `${file.name} (${loadedSheetsNames.join(' + ')})`,
+          wtrRecords: parsedWtrRecords,
+          sheetRecords: combinedDetailRecords,
+          incomingRows: parsedIncomingRows,
+          totalIncomingQty: inQty,
+          totalIncomingCount: inCount
+        };
+
+        window.loadSavedReportData(payload);
+        if (typeof window.saveReportToCloud === 'function') {
+          window.saveReportToCloud(payload);
+        }
+      } catch (err) {
+        console.error(err);
+        showError('حدث خطأ أثناء قراءة ملف الإكسيل: ' + err.message);
+      } finally {
+        e.target.value = '';
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+
+  window.loadSavedReportData = function(payload) {
+    if (!payload) return;
+    wtrRecords = Array.isArray(payload.wtrRecords) ? payload.wtrRecords : (Array.isArray(payload.allRecords) ? payload.allRecords : []);
+    sheetRecords = Array.isArray(payload.sheetRecords) ? payload.sheetRecords : wtrRecords;
+    incomingRowsList = Array.isArray(payload.incomingRows) ? payload.incomingRows : [];
+    totalIncomingQty = Number(payload.totalIncomingQty || 0);
+    totalIncomingCount = Number(payload.totalIncomingCount || 0);
+
+    const statusEl = document.getElementById('fileStatus');
+    if (statusEl && payload.fileName) {
+      statusEl.textContent = `📄 الملف المحمل: ${payload.fileName} | WTR: ${wtrRecords.length} حركة | مقاولين وذاتي: ${sheetRecords.length} حركة`;
+      statusEl.style.display = 'block';
+    }
+
+    allContractors = [...new Set(sheetRecords.map(r => r.contractor).filter(Boolean))].sort();
+    setupContractorCombobox();
+    updateKPIs();
+    renderCharts();
+    applyFilters();
+  };
+
+  function openIncomingAuditModal() {
+    if (incomingRowsList.length === 0 && totalIncomingCount === 0) {
+      showError('لا توجد بيانات وارد محملة حالياً. يرجى رفع ملف الإكسيل أولاً.');
+      return;
+    }
+
+    const sortedByQty = [...incomingRowsList].sort((a, b) => b.qty - a.qty);
+    const maxRow = sortedByQty[0];
+
+    document.getElementById('incomingAuditSummary').innerHTML = `
+      <div>• <strong>إجمالي الكمية المحسوبة:</strong> <span style="color:var(--gold); font-weight:900;">${formatNumber(totalIncomingQty)} لتر</span> (${totalIncomingCount} حركة)</div>
+      ${maxRow ? `<div>• <strong>أكبر إذن وارد تم جمعه:</strong> <span style="color:#60a5fa; font-weight:800;">${formatNumber(maxRow.qty)} لتر</span> (في صف الإكسيل رقم <b>${maxRow.excelRow}</b> - ${maxRow.permit} - ${maxRow.source})</div>` : ''}
+    `;
+
+    const rowsHtml = incomingRowsList.map((r, i) => `
+      <tr>
+        <td>${i + 1}</td>
+        <td style="color:#60a5fa; font-weight:bold;">صف ${r.excelRow}</td>
+        <td>${r.date || '-'}</td>
+        <td>${r.ledger}</td>
+        <td>${r.permit}</td>
+        <td>${r.source}</td>
+        <td style="font-weight:800; color:var(--gold);">${formatNumber(r.qty)}</td>
+        <td>${r.book}</td>
+      </tr>
+    `).join('');
+
+    document.getElementById('incomingAuditBody').innerHTML = `
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>رقم الصف بالإكسيل</th>
+              <th>التاريخ</th>
+              <th>الدفتر</th>
+              <th>نوع الإذن</th>
+              <th>المورد / الجهة</th>
+              <th>الكمية (لتر)</th>
+              <th>رقم الإذن</th>
+            </tr>
+          </thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      </div>
+    `;
+
+    document.getElementById('incomingAuditModal').classList.add('open');
+  }
+
+  function closeIncomingAuditModal() {
+    document.getElementById('incomingAuditModal').classList.remove('open');
+  }
+
+  function setupContractorCombobox() {
+    const input = document.getElementById('contractorInput');
+    const menu = document.getElementById('contractorMenu');
+    const arrow = document.getElementById('comboboxArrow');
+
+    function renderMenu(filterText) {
+      const sheetType = document.getElementById('sheetFilter').value;
+      const sourceRecords = sheetType === 'all' ? sheetRecords : sheetRecords.filter(r => r.type === sheetType);
+      const listToUse = sourceRecords.length > 0
+        ? [...new Set(sourceRecords.map(r => r.contractor).filter(Boolean))].sort()
+        : allContractors;
+
+      const q = normalizeArabic(filterText);
+      const matches = q ? listToUse.filter(c => normalizeArabic(c).includes(q)) : listToUse;
+      if (matches.length === 0) {
+        menu.innerHTML = `<div class="combobox-empty">${sheetRecords.length === 0 ? 'يرجى رفع ملف الإكسيل أولاً' : 'لا توجد جهة مطابقة'}</div>`;
+      } else {
+        menu.innerHTML = `<div class="combobox-item" data-val="">-- جميع الجهات (${matches.length}) --</div>` +
+          matches.map(c => `<div class="combobox-item" data-val="${c.replace(/"/g, '&quot;')}">${c}</div>`).join('');
+      }
+      menu.querySelectorAll('.combobox-item').forEach(item => {
+        const selectItem = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          input.value = item.dataset.val;
+          menu.classList.remove('open');
+          input.blur();
+          applyFilters();
+        };
+        item.addEventListener('pointerdown', selectItem);
+        item.addEventListener('click', selectItem);
+      });
+    }
+
+    window.refreshContractorMenu = () => renderMenu(input.value);
+
+    input.onfocus = () => { renderMenu(input.value); menu.classList.add('open'); };
+    input.onclick = (e) => { e.stopPropagation(); renderMenu(input.value); menu.classList.add('open'); };
+    input.oninput = () => { renderMenu(input.value); menu.classList.add('open'); applyFilters(); };
+    arrow.onpointerdown = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (menu.classList.contains('open')) {
+        menu.classList.remove('open');
+      } else {
+        renderMenu('');
+        menu.classList.add('open');
+      }
+    };
+  }
+
+  function onSheetFilterChange() {
+    if (typeof window.refreshContractorMenu === 'function') {
+      window.refreshContractorMenu();
+    }
+    applyFilters();
+  }
+
+  document.addEventListener('pointerdown', (e) => {
+    const box = document.getElementById('contractorCombobox');
+    const menu = document.getElementById('contractorMenu');
+    if (box && menu && !box.contains(e.target)) {
+      menu.classList.remove('open');
+    }
+  });
+
+  setupContractorCombobox();
+
+  // تحديث المربعات الأربعة من صفحة WTR
+  function updateKPIs() {
+    const contRecords = wtrRecords.filter(r => r.type === 'contractors');
+    const transRecords = wtrRecords.filter(r => r.type === 'transport');
+    const selfRecords = wtrRecords.filter(r => r.type === 'self');
+
+    const contTotal = contRecords.reduce((acc, r) => acc + r.qty, 0);
+    const transTotal = transRecords.reduce((acc, r) => acc + r.qty, 0);
+    const selfTotal = selfRecords.reduce((acc, r) => acc + r.qty, 0);
+
+    document.getElementById('kpiIn').textContent = formatNumber(totalIncomingQty) + ' لتر';
+    document.getElementById('kpiInCount').textContent = `${totalIncomingCount} إذن وارد (اضغط لمراجعة التفاصيل)`;
+
+    document.getElementById('kpiCont').textContent = formatNumber(contTotal) + ' لتر';
+    document.getElementById('kpiContCount').textContent = `${contRecords.length} حركة صرف بالخصم / للغير`;
+
+    document.getElementById('kpiTrans').textContent = formatNumber(transTotal) + ' لتر';
+    document.getElementById('kpiTransCount').textContent = `${transRecords.length} حركة لإدارة النقل`;
+
+    document.getElementById('kpiSelf').textContent = formatNumber(selfTotal) + ' لتر';
+    document.getElementById('kpiSelfCount').textContent = `${selfRecords.length} حركة تشغيل موقع`;
+  }
+
+  // رسم الرسوم البيانية من صفحة WTR
+  function renderCharts() {
+    if (typeof Chart === 'undefined') return;
+    const isLight = document.body.classList.contains('light-mode');
+    const textColor = isLight ? '#0f172a' : '#f8fafc';
+    const mutedColor = isLight ? '#475569' : '#cbd5e1';
+    const gridColor = isLight ? 'rgba(15, 23, 42, 0.1)' : 'rgba(248, 250, 252, 0.1)';
+
+    const contMap = {};
+    let contTotal = 0;
+    let transTotal = 0;
+    let selfTotal = 0;
+
+    wtrRecords.forEach(r => {
+      if (r.type === 'transport') {
+        transTotal += r.qty;
+      } else if (r.type === 'self') {
+        selfTotal += r.qty;
+      } else {
+        contTotal += r.qty;
+        const name = (r.contractor && r.contractor !== 'صرف بالخصم') ? r.contractor : 'غير محدد';
+        contMap[name] = (contMap[name] || 0) + r.qty;
+      }
+    });
+
+    const top10 = Object.entries(contMap).sort((a, b) => b[1] - a[1]).slice(0, 10);
+    const maxContractorQty = top10.length > 0 ? top10[0][1] : 10;
+    const calcContractorPct = (val) => contTotal > 0 ? ((val / contTotal) * 100).toFixed(1) : '0.0';
+
+    const horizontalBarLabelsPlugin = {
+      id: 'horizontalBarLabels',
+      afterDatasetsDraw(chart) {
+        const { ctx, chartArea } = chart;
+        ctx.save();
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.font = 'bold 12px "Segoe UI", Tahoma, Arial, sans-serif';
+
+        const meta = chart.getDatasetMeta(0);
+        meta.data.forEach((bar, index) => {
+          const val = top10[index] ? top10[index][1] : 0;
+          const pct = calcContractorPct(val);
+          const labelText = `${formatNumber(val)} لتر (${pct}%)`;
+
+          // تثبيت الأرقام والنسب في عمود واضح في أقصى اليمين بعيداً عن أسماء المقاولين
+          const xPos = chartArea.right + 10;
+          ctx.fillStyle = isLight ? '#0f172a' : '#6ee7b7';
+          ctx.fillText(labelText, xPos, bar.y);
+        });
+        ctx.restore();
+      }
+    };
+
+    if (topChartInstance) topChartInstance.destroy();
+    const ctx1 = document.getElementById('topContractorsChart').getContext('2d');
+    topChartInstance = new Chart(ctx1, {
+      type: 'bar',
+      data: {
+        labels: top10.map(item => item[0]),
+        datasets: [{
+          label: 'الكمية (لتر)',
+          data: top10.map(item => item[1]),
+          backgroundColor: '#10b981',
+          hoverBackgroundColor: '#34d399',
+          borderRadius: 6,
+          barPercentage: 0.72
+        }]
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        layout: {
+          padding: { left: 12, right: 155, top: 6, bottom: 6 }
+        },
+        onClick: (_, elements) => {
+          if (elements.length > 0) {
+            const idx = elements[0].index;
+            document.getElementById('sheetFilter').value = 'contractors';
+            document.getElementById('contractorInput').value = top10[idx][0];
+            onSheetFilterChange();
+          }
+        },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            rtl: true,
+            titleFont: { size: 13, weight: 'bold' },
+            bodyFont: { size: 13 },
+            callbacks: {
+              label: (ctx) => {
+                const val = ctx.raw || 0;
+                const pct = calcContractorPct(val);
+                return ` الكمية المسحوبة: ${formatNumber(val)} لتر (${pct}% من صرف الغير)`;
+              }
+            }
+          }
+        },
+        scales: {
+          x: {
+            beginAtZero: true,
+            suggestedMax: maxContractorQty * 1.1,
+            ticks: { color: mutedColor, font: { size: 11 }, callback: (v) => formatNumber(v) },
+            grid: { color: gridColor }
+          },
+          y: {
+            position: 'left',
+            ticks: {
+              color: textColor,
+              font: { size: 12, weight: 'bold' },
+              autoSkip: false,
+              padding: 8
+            },
+            grid: { display: false }
+          }
+        }
+      },
+      plugins: [horizontalBarLabelsPlugin]
+    });
+
+    const grandDisbursed = contTotal + transTotal + selfTotal;
+    const hintEl = document.getElementById('totalDisbursedHint');
+    if (hintEl) hintEl.textContent = `إجمالي المنصرف: ${formatNumber(grandDisbursed)} لتر`;
+
+    const calcPct = (val) => grandDisbursed > 0 ? ((val / grandDisbursed) * 100).toFixed(1) : '0.0';
+    const distLabels = [
+      'صرف بالخصم',
+      'تشغيل - إدارة النقل',
+      'تشغيل - موقع'
+    ];
+    const distValues = [contTotal, transTotal, selfTotal];
+    const maxVal = Math.max(...distValues, 10);
+
+    const barTopLabelsPlugin = {
+      id: 'barTopLabels',
+      afterDatasetsDraw(chart) {
+        const { ctx } = chart;
+        ctx.save();
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+
+        const meta = chart.getDatasetMeta(0);
+        meta.data.forEach((bar, index) => {
+          const val = distValues[index];
+          const pct = calcPct(val);
+
+          ctx.font = 'bold 12px "Segoe UI", Tahoma, Arial, sans-serif';
+          ctx.fillStyle = textColor;
+          ctx.fillText(`${formatNumber(val)} لتر`, bar.x, bar.y - 18);
+
+          ctx.font = 'bold 11.5px "Segoe UI", Tahoma, Arial, sans-serif';
+          ctx.fillStyle = isLight ? '#059669' : '#34d399';
+          ctx.fillText(`(${pct}%)`, bar.x, bar.y - 4);
+        });
+        ctx.restore();
+      }
+    };
+
+    if (distChartInstance) distChartInstance.destroy();
+    const ctx2 = document.getElementById('distributionChart').getContext('2d');
+    distChartInstance = new Chart(ctx2, {
+      type: 'bar',
+      data: {
+        labels: distLabels,
+        datasets: [{
+          label: 'الكمية المنصرفة (لتر)',
+          data: distValues,
+          backgroundColor: ['#3b82f6', '#f59e0b', '#f43f5e'],
+          borderRadius: 10,
+          maxBarThickness: 65
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        layout: {
+          padding: { top: 38, left: 10, right: 10, bottom: 4 }
+        },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            rtl: true,
+            titleFont: { size: 13, weight: 'bold' },
+            bodyFont: { size: 13 },
+            callbacks: {
+              label: function(ctx) {
+                const val = ctx.raw || 0;
+                const pct = calcPct(val);
+                return ` الكمية: ${formatNumber(val)} لتر (${pct}%)`;
+              }
+            }
+          }
+        },
+        scales: {
+          x: {
+            ticks: { color: textColor, font: { weight: 'bold', size: 12 } },
+            grid: { display: false }
+          },
+          y: {
+            beginAtZero: true,
+            suggestedMax: maxVal * 1.18,
+            ticks: { color: mutedColor, font: { size: 11 }, callback: (v) => formatNumber(v) },
+            grid: { color: gridColor }
+          }
+        }
+      },
+      plugins: [barTopLabelsPlugin]
+    });
+  }
+
+  // فلترة مربعات البحث الخمسة من صفحتي "مقاولين" و "ذاتي"
+  function applyFilters() {
+    const sheetType = document.getElementById('sheetFilter').value;
+    const contractorRaw = document.getElementById('contractorInput').value;
+    const contractorQuery = normalizeArabic(contractorRaw);
+    const dateFrom = document.getElementById('dateFrom').value;
+    const dateTo = document.getElementById('dateTo').value;
+    const vehicleQuery = normalizeArabic(document.getElementById('vehicleInput').value);
+
+    filteredRecords = sheetRecords.filter(r => {
+      if (sheetType !== 'all' && r.type !== sheetType) return false;
+      if (contractorQuery && !normalizeArabic(r.contractor).includes(contractorQuery)) return false;
+      if (dateFrom && r.date && r.date < dateFrom) return false;
+      if (dateTo && r.date && r.date > dateTo) return false;
+      if (vehicleQuery && !normalizeArabic(r.vehicle).includes(vehicleQuery) && !normalizeArabic(r.equip).includes(vehicleQuery)) return false;
+      return true;
+    });
+
+    filteredRecords.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+
+    renderTable();
+    renderVehicleSummary();
+  }
+
+  function resetFilters() {
+    document.getElementById('sheetFilter').value = 'all';
+    document.getElementById('contractorInput').value = '';
+    document.getElementById('dateFrom').value = '';
+    document.getElementById('dateTo').value = '';
+    document.getElementById('vehicleInput').value = '';
+    applyFilters();
+  }
+
+  function getBadgeClass(type) {
+    if (type === 'self') return 'badge-self';
+    return 'badge-cont';
+  }
+
+  function renderTable() {
+    const tbody = document.getElementById('tableBody');
+    const banner = document.getElementById('resultBanner');
+
+    if (filteredRecords.length === 0) {
+      banner.style.display = 'none';
+      tbody.innerHTML = `<tr><td colspan="9" class="empty-state">${sheetRecords.length === 0 ? '⬆️ اضغط على زر <b>Upload File</b> بالأعلى لرفع ملف الإكسيل والبدء' : '🔍 لا توجد حركات مطابقة لمعايير البحث الحالية'}</td></tr>`;
+      return;
+    }
+
+    const totalQty = filteredRecords.reduce((acc, r) => acc + r.qty, 0);
+    const contractorName = document.getElementById('contractorInput').value.trim() || 'جميع الجهات';
+    banner.style.display = 'flex';
+    document.getElementById('filterSummaryText').innerHTML = `الجهة / المقاول: <strong>${contractorName}</strong>`;
+    document.getElementById('filteredTotalQty').textContent = formatNumber(totalQty) + ' لتر';
+    document.getElementById('filteredRowsCount').textContent = filteredRecords.length;
+
+    tbody.innerHTML = filteredRecords.map((r, idx) => `
+      <tr>
+        <td>${idx + 1}</td>
+        <td><span class="badge ${getBadgeClass(r.type)}">${r.sheetLabel}</span></td>
+        <td>${r.date || '-'}</td>
+        <td style="font-weight:700;">${r.contractor}</td>
+        <td>${r.vehicle}</td>
+        <td style="font-weight:800; color:var(--gold);">${formatNumber(r.qty)}</td>
+        <td>${r.book}</td>
+        <td>${r.receiver}</td>
+        <td>${r.notes}</td>
+      </tr>
+    `).join('');
+  }
+
+  function getVehicleSummaryData() {
+    const map = {};
+    filteredRecords.forEach(r => {
+      const key = r.vehicle || 'بدون رقم';
+      if (!map[key]) {
+        map[key] = { vehicle: key, equip: r.equip, count: 0, total: 0 };
+      }
+      map[key].count++;
+      map[key].total += r.qty;
+    });
+    return Object.values(map).sort((a, b) => b.total - a.total);
+  }
+
+  function renderVehicleSummary() {
+    const panel = document.getElementById('vehicleSummaryPanel');
+    const grid = document.getElementById('vehicleCardsGrid');
+    if (filteredRecords.length === 0) {
+      panel.style.display = 'none';
+      return;
+    }
+
+    const summary = getVehicleSummaryData();
+    panel.style.display = 'block';
+    document.getElementById('vehicleSummaryTitle').textContent = '🚜 ملخص المسحوبات خلال الفترة :';
+    document.getElementById('vehicleSummarySubtitle').textContent = `عدد المعدات / السيارات: ${summary.length}`;
+
+    grid.innerHTML = summary.map(v => `
+      <div class="vehicle-card">
+        <div class="vehicle-card-top">
+          <span>🚜 ${v.vehicle}</span>
+          <span class="vehicle-card-type">${v.equip !== '-' ? v.equip : ''}</span>
+        </div>
+        <div class="vehicle-card-qty">${formatNumber(v.total)} لتر</div>
+        <div class="vehicle-card-meta">عدد مرات التفويل: ${v.count} مرة</div>
+      </div>
+    `).join('');
+  }
+
+  function getReportMetadata() {
+    const contractorInput = document.getElementById('contractorInput').value.trim();
+    const uniqueContractors = [...new Set(filteredRecords.map(r => r.contractor))];
+    const contractorDisplay = contractorInput || (uniqueContractors.length === 1 ? uniqueContractors[0] : 'جميع الجهات');
+
+    const dates = filteredRecords.map(r => r.date).filter(Boolean).sort();
+    const fromDate = document.getElementById('dateFrom').value || (dates.length ? dates[0] : '-');
+    const toDate = document.getElementById('dateTo').value || (dates.length ? dates[dates.length - 1] : '-');
+    const totalQty = filteredRecords.reduce((acc, r) => acc + r.qty, 0);
+    const todayStr = new Date().toISOString().split('T')[0];
+
+    return { contractorDisplay, fromDate, toDate, totalQty, todayStr };
+  }
+
+  function buildPdfDocumentHTML() {
+    const { contractorDisplay, fromDate, toDate, totalQty, todayStr } = getReportMetadata();
+    const vehicleSummary = getVehicleSummaryData();
+
+    const summaryRowsHtml = vehicleSummary.map((v, i) => `
+      <tr>
+        <td>${i + 1}</td>
+        <td style="font-weight:bold;">${v.vehicle}</td>
+        <td>${v.count}</td>
+        <td style="font-weight:bold;">${formatNumber(v.total)} لتر</td>
+      </tr>
+    `).join('');
+
+    const detailRowsHtml = filteredRecords.map((r, i) => `
+      <tr>
+        <td>${i + 1}</td>
+        <td>${r.sheetLabel}</td>
+        <td>${r.date || '-'}</td>
+        <td>${r.contractor}</td>
+        <td>${r.vehicle}</td>
+        <td style="font-weight:bold;">${formatNumber(r.qty)}</td>
+        <td>${r.book}</td>
+        <td>${r.receiver}</td>
+        <td>${r.notes}</td>
+      </tr>
+    `).join('');
+
+    return `
+      <div class="pdf-paper">
+        <div class="pdf-doc-header">
+          <div class="pdf-brand-side">
+            <div class="pdf-brand-top">
+              <svg width="26" height="26" viewBox="0 0 36 36" fill="none">
+                <rect width="36" height="36" rx="8" fill="#FEF3C7" stroke="#D97706" stroke-width="2"/>
+                <path d="M18 7C18 7 10 15.6 10 21.2C10 25.6183 13.5817 29.2 18 29.2C22.4183 29.2 26 25.6183 26 21.2C26 15.6 18 7 18 7Z" fill="#D97706"/>
+              </svg>
+              <strong style="font-size:17px; color:#0f172a;">Solar Report</strong>
+            </div>
+            <div class="pdf-project-name">اسم المشروع : مستقبل مصر 400 ألف فدان - زون جي</div>
+          </div>
+
+          <div class="pdf-center-title">
+            <h2>مسحوبات سولار</h2>
+            <div class="pdf-contractor-highlight">${contractorDisplay}</div>
+          </div>
+
+          <div class="pdf-date-side">
+            <div><strong>تاريخ التقرير:</strong></div>
+            <div>${todayStr}</div>
+          </div>
+        </div>
+
+        <div class="pdf-doc-meta">
+          <div><strong>من تاريخ :</strong> ${fromDate}</div>
+          <div><strong>إلى تاريخ :</strong> ${toDate}</div>
+          <div><strong>إجمالي الكمية خلال الفترة :</strong> <span style="color:#b45309; font-weight:900;">${formatNumber(totalQty)} لتر</span></div>
+        </div>
+
+        <div class="pdf-section-title">ملخص المسحوبات خلال الفترة :</div>
+        <table class="pdf-table" style="margin-bottom:20px;">
+          <thead>
+            <tr>
+              <th style="width:45px;">م</th>
+              <th>رقم المعدة</th>
+              <th>عدد مرات التفويل</th>
+              <th>إجمالي السحب</th>
+            </tr>
+          </thead>
+          <tbody>${summaryRowsHtml}</tbody>
+          <tfoot>
+            <tr>
+              <td colspan="3" style="text-align:center;">إجمالي المسحوبات</td>
+              <td>${formatNumber(totalQty)} لتر</td>
+            </tr>
+          </tfoot>
+        </table>
+
+        <div class="pdf-section-title">تفاصيل حركات السحب خلال الفترة :</div>
+        <table class="pdf-table">
+          <thead>
+            <tr>
+              <th style="width:35px;">م</th>
+              <th>الجهة</th>
+              <th>التاريخ</th>
+              <th>المقاول</th>
+              <th>رقم المعدة</th>
+              <th>الكمية ( لتر )</th>
+              <th>رقم الاذن</th>
+              <th>المستلم</th>
+              <th>ملاحظات</th>
+            </tr>
+          </thead>
+          <tbody>${detailRowsHtml}</tbody>
+          <tfoot>
+            <tr>
+              <td colspan="5" style="text-align:center;">الإجمالي الكلي</td>
+              <td colspan="4">${formatNumber(totalQty)} لتر</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    `;
+  }
+
+  function openPdfPreviewModal() {
+    if (filteredRecords.length === 0) {
+      showError('لا توجد بيانات لعرضها في التقرير. يرجى رفع ملف أو تعديل الفلاتر.');
+      return;
+    }
+    document.getElementById('pdfPreviewContent').innerHTML = buildPdfDocumentHTML();
+    document.getElementById('pdfPreviewModal').classList.add('open');
+  }
+
+  function closePdfPreviewModal() {
+    document.getElementById('pdfPreviewModal').classList.remove('open');
+  }
+
+  function openExcelPreviewModal() {
+    if (filteredRecords.length === 0) {
+      showError('لا توجد بيانات لعرضها في جدول الإكسيل.');
+      return;
+    }
+    const totalQty = filteredRecords.reduce((acc, r) => acc + r.qty, 0);
+    const rows = filteredRecords.map((r, i) => `
+      <tr>
+        <td>${i + 1}</td>
+        <td>${r.sheetLabel}</td>
+        <td>${r.date}</td>
+        <td>${r.contractor}</td>
+        <td>${r.vehicle}</td>
+        <td style="font-weight:bold;">${formatNumber(r.qty)}</td>
+        <td>${r.book}</td>
+        <td>${r.receiver}</td>
+        <td>${r.notes}</td>
+      </tr>
+    `).join('');
+
+    document.getElementById('excelPreviewContent').innerHTML = `
+      <div class="excel-sheet-view">
+        <table>
+          <thead>
+            <tr>
+              <th>م</th>
+              <th>الجهة</th>
+              <th>التاريخ</th>
+              <th>المقاول</th>
+              <th>رقم المعدة</th>
+              <th>الكمية ( لتر )</th>
+              <th>رقم الاذن</th>
+              <th>المستلم</th>
+              <th>ملاحظات</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+          <tfoot>
+            <tr style="background:#dcfce7; font-weight:bold;">
+              <td colspan="5" style="text-align:center;">الإجمالي</td>
+              <td colspan="4">${formatNumber(totalQty)} لتر</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    `;
+    document.getElementById('excelPreviewModal').classList.add('open');
+  }
+
+  function closeExcelPreviewModal() {
+    document.getElementById('excelPreviewModal').classList.remove('open');
+  }
+
+  function buildWhatsAppMessageText() {
+    const { contractorDisplay, fromDate, toDate, totalQty } = getReportMetadata();
+    const vehicleSummary = getVehicleSummaryData();
+    const lines = [
+      `*مسحوبات سولار - Solar Report*`,
+      `المشروع: مستقبل مصر 400 ألف فدان - زون جي`,
+      `*الجهة / المقاول:* ${contractorDisplay}`,
+      `*من تاريخ:* ${fromDate} | *إلى تاريخ:* ${toDate}`,
+      `*إجمالي الكمية خلال الفترة:* ${formatNumber(totalQty)} لتر`,
+      `-------------------`,
+      `*ملخص المعدات / السيارات:*`
+    ];
+    vehicleSummary.forEach((v, i) => {
+      lines.push(`${i + 1}. ${v.vehicle}: ${formatNumber(v.total)} لتر (${v.count} مرة)`);
+    });
+    return lines.join('\n');
+  }
+
+  function formatWhatsAppPhone(rawPhone) {
+    let digits = String(rawPhone || '').replace(/\D/g, '');
+    if (!digits) return '';
+    if (digits.startsWith('00')) digits = digits.slice(2);
+    if (digits.startsWith('01') && digits.length === 11) {
+      digits = '2' + digits;
+    }
+    return digits;
+  }
+
+  function updateWhatsAppDirectLinks() {
+    const msg = document.getElementById('waTextPreview').value || buildWhatsAppMessageText();
+    const encoded = encodeURIComponent(msg);
+    const phoneInput = document.getElementById('waTargetPhone');
+    const formattedPhone = formatWhatsAppPhone(phoneInput ? phoneInput.value : '');
+
+    if (formattedPhone) {
+      try { localStorage.setItem('solar_last_wa_phone', phoneInput.value.trim()); } catch (e) {}
+      document.getElementById('waDesktopLink').href = `whatsapp://send?phone=${formattedPhone}&text=${encoded}`;
+      document.getElementById('waWebLink').href = `https://web.whatsapp.com/send?phone=${formattedPhone}&text=${encoded}`;
+    } else {
+      document.getElementById('waDesktopLink').href = `whatsapp://send?text=${encoded}`;
+      document.getElementById('waWebLink').href = `https://web.whatsapp.com/send?text=${encoded}`;
+    }
+  }
+
+  function showWhatsAppShareModal(title, subtitle, fileNote, autoLaunchDesktop = false) {
+    const msg = buildWhatsAppMessageText();
+
+    document.getElementById('waModalTitle').textContent = title;
+    document.getElementById('waModalSubtitle').textContent = subtitle;
+    document.getElementById('waTextPreview').value = msg;
+    document.getElementById('waFileNote').innerHTML = fileNote;
+
+    const phoneInput = document.getElementById('waTargetPhone');
+    if (phoneInput && !phoneInput.value) {
+      try {
+        const savedPhone = localStorage.getItem('solar_last_wa_phone');
+        if (savedPhone) phoneInput.value = savedPhone;
+      } catch (e) {}
+    }
+
+    updateWhatsAppDirectLinks();
+
+    const ta = document.getElementById('waTextPreview');
+    ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+
+    document.getElementById('waModal').classList.add('open');
+
+    if (autoLaunchDesktop) {
+      const desktopHref = document.getElementById('waDesktopLink').href;
+      setTimeout(() => {
+        window.location.href = desktopHref;
+      }, 350);
+    }
+  }
+
+  function closeWaModal() {
+    document.getElementById('waModal').classList.remove('open');
+  }
+
+  function copyWaTextManual() {
+    const ta = document.getElementById('waTextPreview');
+    ta.select();
+    try {
+      document.execCommand('copy');
+      const btn = document.getElementById('waCopyBtn');
+      btn.textContent = '✅ تم نسخ النص بنجاح!';
+      setTimeout(() => { btn.textContent = '📋 نسخ النص مرة أخرى'; }, 2500);
+    } catch (e) {}
+  }
+
+  function sanitizeFileNamePart(str) {
+    return String(str || 'تقرير')
+      .trim()
+      .replace(/[\\\/:*?"<>|]/g, '')
+      .replace(/\s+/g, '_');
+  }
+
+  async function sharePDFOnWhatsApp() {
+    if (filteredRecords.length === 0) {
+      showError('لا توجد بيانات لتصديرها ومشاركتها.');
+      return;
+    }
+
+    const btn = document.getElementById('btnShareWaPdf');
+    const origText = btn ? btn.textContent : '';
+    if (btn) btn.textContent = '⏳ جاري تجهيز الـ PDF...';
+
+    const { contractorDisplay, fromDate, toDate } = getReportMetadata();
+    const safeContractor = sanitizeFileNamePart(contractorDisplay);
+    const safeFrom = sanitizeFileNamePart(fromDate);
+    const safeTo = sanitizeFileNamePart(toDate);
+    const fileName = `${safeContractor}_من_${safeFrom}_الى_${safeTo}.pdf`;
+
+    const container = document.getElementById('pdfTemplateContainer');
+    container.innerHTML = buildPdfDocumentHTML();
+    container.style.opacity = '1';
+    container.style.zIndex = '99999';
+
+    try {
+      const opt = {
+        margin: [8, 8, 8, 8],
+        filename: fileName,
+        image: { type: 'jpeg', quality: 0.96 },
+        html2canvas: { scale: 1.8, useCORS: true, scrollY: 0 },
+        jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+        pagebreak: { mode: ['css', 'legacy'] }
+      };
+
+      const pdfArrayBuffer = await html2pdf().set(opt).from(container.firstElementChild).outputPdf('arraybuffer');
+      const pdfBlob = new Blob([pdfArrayBuffer], { type: 'application/pdf' });
+      const pdfFile = new File([pdfBlob], fileName, { type: 'application/pdf' });
+      const msgText = buildWhatsAppMessageText();
+      const isMobileDevice = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+      if (isMobileDevice && navigator.canShare && navigator.canShare({ files: [pdfFile] })) {
+        try {
+          await navigator.share({
+            files: [pdfFile],
+            title: fileName,
+            text: msgText
+          });
+          return;
+        } catch (shareErr) {
+          if (shareErr.name === 'AbortError') return;
+        }
+      }
+
+      const url = URL.createObjectURL(pdfBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+
+      showWhatsAppShareModal(
+        '📲 مشاركة تقرير PDF عبر واتساب الكمبيوتر',
+        'تم تنزيل ملف الـ PDF وفتح تطبيق واتساب على الكمبيوتر مباشرة.',
+        `📎 تم حفظ الملف باسم: <b>${fileName}</b> في مجلد التنزيلات (Downloads)؛ اسحبه وأفلته داخل محادثة الشخص المختار في تطبيق واتساب.`,
+        true
+      );
+    } catch (err) {
+      console.error(err);
+      showError('حدث خطأ أثناء إنشاء ملف الـ PDF: ' + err.message);
+    } finally {
+      if (btn) btn.textContent = origText;
+      container.style.opacity = '0';
+      container.style.zIndex = '-9999';
+      container.innerHTML = '';
+    }
+  }
+
+  async function shareExcelOnWhatsApp() {
+    if (filteredRecords.length === 0) {
+      showError('لا توجد بيانات لتصديرها ومشاركتها.');
+      return;
+    }
+
+    const { contractorDisplay, fromDate, toDate, totalQty } = getReportMetadata();
+    const safeContractor = sanitizeFileNamePart(contractorDisplay);
+    const fileName = `${safeContractor}_من_${sanitizeFileNamePart(fromDate)}_الى_${sanitizeFileNamePart(toDate)}.xlsx`;
+
+    const sheetData = [
+      ['م', 'الجهة', 'التاريخ', 'المقاول', 'رقم المعدة', 'الكمية ( لتر )', 'رقم الاذن', 'المستلم', 'ملاحظات'],
+      ...filteredRecords.map((r, i) => [
+        i + 1, r.sheetLabel, r.date, r.contractor, r.vehicle, r.qty, r.book, r.receiver, r.notes
+      ]),
+      ['', '', '', '', 'الإجمالي', totalQty, '', '', '']
+    ];
+
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet(sheetData);
+    XLSX.utils.book_append_sheet(wb, ws, 'مسحوبات سولار');
+
+    const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+    const excelBlob = new Blob([wbout], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const excelFile = new File([excelBlob], fileName, { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const msgText = buildWhatsAppMessageText();
+    const isMobileDevice = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+    if (isMobileDevice && navigator.canShare && navigator.canShare({ files: [excelFile] })) {
+      try {
+        await navigator.share({
+          files: [excelFile],
+          title: fileName,
+          text: msgText
+        });
+        return;
+      } catch (shareErr) {
+        if (shareErr.name === 'AbortError') return;
+      }
+    }
+
+    XLSX.writeFile(wb, fileName);
+
+    showWhatsAppShareModal(
+      '📊 مشاركة ملف Excel عبر واتساب الكمبيوتر',
+      'تم تنزيل ملف الإكسيل وفتح تطبيق واتساب على الكمبيوتر مباشرة.',
+      `📎 تم حفظ الملف باسم: <b>${fileName}</b> في مجلد التنزيلات (Downloads)؛ اسحبه وأفلته داخل محادثة الشخص المختار في تطبيق واتساب.`,
+      true
+    );
+  }
+</script>
+</body>
+</html>
